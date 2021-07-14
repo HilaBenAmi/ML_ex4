@@ -22,6 +22,10 @@ from torch import nn
 from torch.nn import functional as F
 import optim_weight_ema
 
+from sklearn.preprocessing import label_binarize
+from sklearn import metrics
+from sklearn.metrics import confusion_matrix
+
 import os
 import pickle
 import cmdline_helpers
@@ -29,8 +33,8 @@ import cmdline_helpers
 INNER_K_FOLD = 2 # 3
 OUTER_K_FOLD = 2 # 10
 num_epochs = 1 # 100
-bo_num_iter = 2  # 50
-init_points = 5
+bo_num_iter = 1  # 50
+init_points = 1
 
 exp = 'mnist_svhn'
 log_file = f'results_exp_meanteacher_hila/log_{exp}_example_run.txt'
@@ -53,6 +57,13 @@ def log(text):
             f.write(text + '\n')
             f.flush()
             f.close()
+
+
+def ensure_containing_dir_exists(path):
+    dir_name = os.path.dirname(path)
+    if dir_name != '' and not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+    return path
 
 
 def runner(exp):
@@ -107,13 +118,13 @@ def runner(exp):
 def build_and_train_model(source_train_x_inner, source_train_y_inner, target_train_x_inner,
                 source_validation_x, source_validation_y, target_validation_x, target_validation_y,
                confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_balance, learning_rate,
-               arch='', loss='var', double_softmax=False, fix_ema=False,
+               arch='', test_model=False, loss='var', double_softmax=False, fix_ema=False,
                cls_bal_scale=False, cls_bal_scale_range=0.0, cls_balance_loss='bce',
                combine_batches=False, standardise_samples=False,
                src_affine_std=0.0, src_xlat_range=0.0, src_hflip=False,
-               src_intens_flip=False, src_gaussian_noise_std=0.1,
+               src_intens_flip=False, src_gaussian_noise_std=0.0,
                tgt_affine_std=0.0, tgt_xlat_range=0.0, tgt_hflip=False,
-               tgt_intens_flip='', tgt_gaussian_noise_std=0.1):
+               tgt_intens_flip='', tgt_gaussian_noise_std=0.0):
 
     net_class, expected_shape = network_architectures.get_net_and_shape_for_architecture(arch)
 
@@ -331,45 +342,33 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
 
     print('Compiled training function')
 
-    def f_pred_src(X_sup):
+    def f_pred(X_sup):
         X_var = torch.tensor(X_sup, dtype=torch.float, device=torch_device)
         student_net.eval()
         teacher_net.eval()
         return (F.softmax(student_net(X_var), dim=1).detach().cpu().numpy(),
                 F.softmax(teacher_net(X_var), dim=1).detach().cpu().numpy())
 
-    def f_pred_tgt(X_sup):
-        X_var = torch.tensor(X_sup, dtype=torch.float, device=torch_device)
-        student_net.eval()
-        teacher_net.eval()
-        return (F.softmax(student_net(X_var), dim=1).detach().cpu().numpy(),
-                F.softmax(teacher_net(X_var), dim=1).detach().cpu().numpy())
-
-    def f_eval_src(X_sup, y_sup):
-        y_pred_prob_stu, y_pred_prob_tea = f_pred_src(X_sup)
+    def f_eval(X_sup, y_sup):
+        y_pred_prob_stu, y_pred_prob_tea = f_pred(X_sup)
         y_pred_stu = np.argmax(y_pred_prob_stu, axis=1)
         y_pred_tea = np.argmax(y_pred_prob_tea, axis=1)
         return (float((y_pred_stu != y_sup).sum()), float((y_pred_tea != y_sup).sum()))
 
-    def f_eval_tgt(X_sup, y_sup):
-        y_pred_prob_stu, y_pred_prob_tea = f_pred_tgt(X_sup)
+    def f_pred_for_metrics(X_sup, y_sup):
+        y_pred_prob_stu, y_pred_prob_tea = f_pred(X_sup)
         y_pred_stu = np.argmax(y_pred_prob_stu, axis=1)
         y_pred_tea = np.argmax(y_pred_prob_tea, axis=1)
-        return (float((y_pred_stu != y_sup).sum()), float((y_pred_tea != y_sup).sum()))
+        return (y_pred_stu, y_pred_tea, y_pred_prob_stu, y_pred_prob_tea)
 
     print('Compiled evaluation function')
 
     cmdline_helpers.ensure_containing_dir_exists(log_file)
 
     # Report setttings
-    log('Settings: {}'.format(', '.join(['{}={}'.format(key, settings[key]) for key in sorted(list(settings.keys()))])))
-
-    # Report dataset size
-    log('Dataset:')
-    log('SOURCE Train: X.shape={}, y.shape={}'.format(source_train_x_inner.shape, source_train_y_inner.shape))
-    log('SOURCE Test: X.shape={}, y.shape={}'.format(source_validation_x.shape, source_validation_y.shape))
-    log('TARGET Train: X.shape={}'.format(target_train_x_inner.shape))
-    log('TARGET Test: X.shape={}, y.shape={}'.format(target_validation_x.shape, target_validation_y.shape))
+    log(f'confidence_thresh={confidence_thresh}, rampup={rampup}, teacher_alpha={teacher_alpha},\
+     unsup_weight={unsup_weight}, cls_balance={cls_balance}, learning_rate={learning_rate}')
+    # log('Settings: {}'.format(', '.join(['{}={}'.format(key, settings[key]) for key in sorted(list(settings.keys()))])))
 
     print('Training...')
     sup_ds = data_source.ArrayDataSource([source_train_x_inner, source_train_y_inner], repeats=-1)
@@ -398,6 +397,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
 
     best_conf_mask_rate = 0.0
     best_src_test_err = 1.0
+    t_training_1 = time.time()
     for epoch in range(num_epochs):
         t1 = time.time()
 
@@ -419,8 +419,8 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
         else:
             unsup_loss_string = 'unsup (tgt) loss={:.6f}'.format(train_res[1])
 
-        src_test_err_stu, src_test_err_tea = source_test_ds.batch_map_mean(f_eval_src, batch_size=batch_size * 2)
-        tgt_test_err_stu, tgt_test_err_tea = target_test_ds.batch_map_mean(f_eval_tgt, batch_size=batch_size * 2)
+        src_test_err_stu, src_test_err_tea = source_test_ds.batch_map_mean(f_eval, batch_size=batch_size * 2)
+        tgt_test_err_stu, tgt_test_err_tea = target_test_ds.batch_map_mean(f_eval, batch_size=batch_size * 2)
 
         if use_rampup:
             unsup_loss_string = '{}, rampup={:.3%}'.format(unsup_loss_string, rampup_value)
@@ -450,8 +450,53 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
             'SRC TEST ERR={:.3%}, TGT TEST student err={:.3%}, TGT TEST teacher err={:.3%}'.format(
             improve, epoch, t2 - t1, train_clf_loss, unsup_loss_string, src_test_err_stu, tgt_test_err_stu,
             tgt_test_err_tea))
-
+    t_training_2 = time.time()
+    if test_model:
+        t_inference_1 = time.time()
+        src_pred_stu, src_pred_tea, src_prob_stu, src_prob_tea = source_test_ds.batch_map_concat(f_pred_for_metrics, batch_size=batch_size * 2)
+        t_inference_2 = time.time()
+        tgt_pred_stu, tgt_pred_tea, tgt_prob_stu, tgt_prob_tea = target_test_ds.batch_map_concat(f_pred_for_metrics, batch_size=batch_size * 2)
+        src_stu_scores_dict, src_tea_scores_dict = create_metrics_results(source_validation_y, src_pred_stu, src_pred_tea, src_prob_stu, src_prob_tea)
+        tgt_stu_scores_dict, tgt_tea_scores_dict = create_metrics_results(target_validation_y, tgt_pred_stu, tgt_pred_tea, tgt_prob_stu, tgt_prob_tea)
+        inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred_stu)*1000
+        return src_stu_scores_dict, src_tea_scores_dict, tgt_stu_scores_dict, tgt_tea_scores_dict, round(t_training_2-t_training_1, 3), inference_time_for_1000
     return best_target_tea_err, best_teacher_model_state
+
+
+def calc_metrics(sup_y, sup_y_one_hot, pred_y, prob, class_labels):
+    scores_dict = {}
+    conf = confusion_matrix(sup_y, pred_y)
+    tpr_list = []
+    fpr_list = []
+    for label in range(conf.shape[0]):
+        tpr = conf[label][label] / sum(conf[label])
+        tpr_list.append(tpr)
+        fpr_numerator = sum([pred_row[label] for pred_row in conf]) - conf[label][label]
+        fpr_denominator = sum(conf) - sum(conf[label])
+        fpr_list.append(fpr_numerator / fpr_denominator)
+    scores_dict['tpr'] = np.mean(tpr_list)
+    scores_dict['fpr'] = np.mean(fpr_list)
+
+    # classification_report = metrics.classification_report(sup_y, pred_y, digits=3)
+    # print(classification_report)
+    scores_dict['acc'] = metrics.accuracy_score(sup_y, pred_y)
+    scores_dict['roc_auc'] = metrics.roc_auc_score(sup_y, prob, multi_class='ovr')
+    scores_dict['recall'] = metrics.recall_score(sup_y, pred_y, average='macro')
+    scores_dict['precision'] = metrics.precision_score(sup_y, pred_y, average='macro')
+
+    pred_one_hot = label_binarize(pred_y, classes=class_labels)
+    scores_dict['recall_precision_auc'] = metrics.average_precision_score(sup_y_one_hot, pred_one_hot, average="macro")
+    scores_dict['err'] = float((pred_y != sup_y).mean())
+    return scores_dict
+
+
+def create_metrics_results(sup_y, pred_stu, pred_tea, prob_stu, prob_tea):
+    class_labels = list(np.unique(sup_y))
+    sup_y_one_hot = label_binarize(sup_y, classes=class_labels)
+    stu_scores_dict = calc_metrics(sup_y, sup_y_one_hot, pred_stu, prob_stu, class_labels)
+    tea_scores_dict = calc_metrics(sup_y, sup_y_one_hot, pred_tea, prob_tea, class_labels)
+    return stu_scores_dict, tea_scores_dict
+
 
 
 def get_arch(exp, arch):
@@ -472,9 +517,9 @@ def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_bal
                cls_bal_scale=False, cls_bal_scale_range=0.0, cls_balance_loss='bce',
                combine_batches=False, standardise_samples=False,
                src_affine_std=0.0, src_xlat_range=0.0, src_hflip=False,
-               src_intens_flip=False, src_gaussian_noise_std=0.1,
+               src_intens_flip=False, src_gaussian_noise_std=0.0,
                tgt_affine_std=0.0, tgt_xlat_range=0.0, tgt_hflip=False,
-               tgt_intens_flip='', tgt_gaussian_noise_std=0.1):
+               tgt_intens_flip='', tgt_gaussian_noise_std=0.0):
 
     arch = get_arch(exp, arch)
 
@@ -503,6 +548,8 @@ def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_bal
 
     target_test_err_list = []
     for cv_idx in range(INNER_K_FOLD):
+        print(f'start inner cv {cv_idx}')
+        log(f'start inner cv {cv_idx}')
         source_train_x_inner = source_train_validation_list[cv_idx]['source_train_x']
         source_train_y_inner = source_train_validation_list[cv_idx]['source_train_y']
         source_validation_x = source_train_validation_list[cv_idx]['source_validation_x']
@@ -510,6 +557,14 @@ def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_bal
         target_train_x_inner = target_train_validation_list[cv_idx]['target_train_x']
         target_validation_x = target_train_validation_list[cv_idx]['target_validation_x']
         target_validation_y = target_train_validation_list[cv_idx]['target_validation_y']
+
+        if cv_idx == 0:
+            # Report dataset size
+            log('Dataset:')
+            log('SOURCE Train: X.shape={}, y.shape={}'.format(source_train_x_inner.shape, source_train_y_inner.shape))
+            log('SOURCE Val: X.shape={}, y.shape={}'.format(source_validation_x.shape, source_validation_y.shape))
+            log('TARGET Train: X.shape={}'.format(target_train_x_inner.shape))
+            log('TARGET Val: X.shape={}, y.shape={}'.format(target_validation_x.shape, target_validation_y.shape))
 
         best_target_tea_err, best_teacher_model_state = build_and_train_model(
             source_train_x_inner, source_train_y_inner, target_train_x_inner,
@@ -530,10 +585,21 @@ def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_bal
 def rebuild_and_test_model(params, source_train_x, source_train_y, target_train_x, source_test_x,
                            source_test_y, target_test_x, target_test_y, arch=''):
     arch = get_arch(exp, arch)
-    best_target_tea_err, best_teacher_model_state = build_and_train_model(
+    results = build_and_train_model(
         source_train_x, source_train_y, target_train_x, source_test_x, source_test_y, target_test_x, target_test_y,
-        arch=arch, **params)
-    return best_target_tea_err
+        arch=arch, test_model=True, **params)
+    src_stu_scores_dict = results[0]
+    src_tea_scores_dict = results[1]
+    tgt_stu_scores_dict = results[2]
+    tgt_tea_scores_dict = results[3]
+    training_time = results[4]
+    inference_time = results[5]
+    log(f'src_stu_scores_dict: {src_stu_scores_dict}')
+    log(f'src_tea_scores_dict: {src_tea_scores_dict}')
+    log(f'tgt_stu_scores_dict: {tgt_stu_scores_dict}')
+    log(f'tgt_tea_scores_dict: {tgt_tea_scores_dict}')
+    log(f'training_time: {training_time}')
+    log(f'inference_time for 1000 instences: {inference_time}')
 
 
 
@@ -548,11 +614,11 @@ if __name__ == '__main__':
     elif log_file == 'none':
         log_file = None
 
-    if log_file is not None:
-        if os.path.exists(log_file):
-            msg = 'Output log file {} already exists'.format(log_file)
-            print(msg)
-            raise Exception(msg)
+    # if log_file is not None:
+    #     if os.path.exists(log_file):
+    #         msg = 'Output log file {} already exists'.format(log_file)
+    #         print(msg)
+    #         raise Exception(msg)
 
     cv_source = StratifiedKFold(n_splits=OUTER_K_FOLD, shuffle=True)
     source_train_test_list = []
@@ -560,10 +626,10 @@ if __name__ == '__main__':
         source_dict = {}
         train_data, test_data = source_x[train_idx], source_x[test_idx]
         train_target, test_target = source_y[train_idx], source_y[test_idx]
-        source_dict['source_train_x'] = train_data
-        source_dict['source_train_y'] = train_target
-        source_dict['source_test_x'] = test_data
-        source_dict['source_test_y'] = test_target
+        source_dict['source_train_x'] = train_data[:1000]
+        source_dict['source_train_y'] = train_target[:1000]
+        source_dict['source_test_x'] = test_data[:500]
+        source_dict['source_test_y'] = test_target[:500]
         source_train_test_list.append(source_dict)
 
     cv_target = StratifiedKFold(n_splits=OUTER_K_FOLD, shuffle=True)
@@ -572,14 +638,16 @@ if __name__ == '__main__':
         target_dict = {}
         train_data, test_data = target_x[train_idx], target_x[test_idx]
         train_target, test_target = target_y[train_idx], target_y[test_idx]
-        target_dict['target_train_x'] = train_data
-        target_dict['target_train_y'] = train_target
-        target_dict['target_test_x'] = test_data
-        target_dict['target_test_y'] = test_target
+        target_dict['target_train_x'] = train_data[:1000]
+        target_dict['target_train_y'] = train_target[:1000]
+        target_dict['target_test_x'] = test_data[:500]
+        target_dict['target_test_y'] = test_target[:500]
         target_train_test_list.append(target_dict)
 
     target_test_err_list = []
     for cv_idx in range(OUTER_K_FOLD):
+        print(f'start outer cv {cv_idx}')
+        log(f'start outer cv {cv_idx}')
         source_train_x = source_train_test_list[cv_idx]['source_train_x']
         source_train_y = source_train_test_list[cv_idx]['source_train_y']
         source_test_x = source_train_test_list[cv_idx]['source_test_x']
@@ -588,6 +656,14 @@ if __name__ == '__main__':
         target_train_y = target_train_test_list[cv_idx]['target_train_y']
         target_test_x = target_train_test_list[cv_idx]['target_test_x']
         target_test_y = target_train_test_list[cv_idx]['target_test_y']
+
+        if cv_idx == 0:
+            # Report dataset size
+            log('Dataset:')
+            log('SOURCE Train: X.shape={}, y.shape={}'.format(source_train_x.shape, source_train_y.shape))
+            log('SOURCE Test: X.shape={}, y.shape={}'.format(source_test_x.shape, source_test_y.shape))
+            log('TARGET Train: X.shape={}'.format(target_train_x.shape))
+            log('TARGET Test: X.shape={}, y.shape={}'.format(target_test_x.shape, target_test_y.shape))
 
         domain_adapt_BO = BayesianOptimization(evaluate_exp, {'confidence_thresh': (0.5, 1.0),
                                                             'rampup': (0.0, 100.0),
@@ -600,9 +676,8 @@ if __name__ == '__main__':
         params_domain_adapt = domain_adapt_BO.max['params']
         params_domain_adapt['rampup'] = round(params_domain_adapt['rampup'])
 
-        log(f'CV {cv_idx} - Opt hyper params: {params_domain_adapt}')
+        log(f'outer CV {cv_idx} - Opt hyper params: {params_domain_adapt} \n with target of: {domain_adapt_BO.max["target"]}')
 
-        # todo- more metrics on the test datasets
-        best_target_tea_err = rebuild_and_test_model(params_domain_adapt, source_train_x, source_train_y, target_train_x, source_test_x,
+        rebuild_and_test_model(params_domain_adapt, source_train_x, source_train_y, target_train_x, source_test_x,
                            source_test_y, target_test_x, target_test_y)
-        log(f'TEST target res on teacher: {best_target_tea_err}')
+        log('*********************************************************************** \n')

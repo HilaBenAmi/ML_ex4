@@ -6,6 +6,17 @@ from batchup.datasets import mnist, fashion_mnist, cifar10, svhn, stl, usps
 import domain_datasets
 
 
+
+class dataset_class:
+    def __init__(self, train_X, train_y, test_X, test_y, val_X=np.array([]), val_y=np.array([])):
+        self.train_X = train_X
+        self.test_X = test_X
+        self.train_y = train_y
+        self.test_y = test_y
+        self.val_X = val_X
+        self.val_y = val_y
+
+
 def rgb2grey_tensor(X):
     return (X[:, 0:1, :, :] * 0.2125) + (X[:, 1:2, :, :] * 0.7154) + (X[:, 2:3, :, :] * 0.0721)
 
@@ -71,17 +82,22 @@ def load_mnist(invert=False, zero_centre=False, intensity_scale=1.0, val=False, 
 
     print('Loading MNIST...')
 
-    if val:
-        d_mnist = mnist.MNIST(n_val=10000)
-    else:
-        d_mnist = mnist.MNIST(n_val=0)
-
-    d_mnist.train_X = d_mnist.train_X[:]
-    d_mnist.val_X = d_mnist.val_X[:]
-    d_mnist.test_X = d_mnist.test_X[:]
-    d_mnist.train_y = d_mnist.train_y[:]
-    d_mnist.val_y = d_mnist.val_y[:]
-    d_mnist.test_y = d_mnist.test_y[:]
+    from keras.datasets import mnist
+    (X_train, y_train), (X_test, y_test) = mnist.load_data()
+    X_train = np.array([np.array([item]) for item in X_train])
+    X_test = np.array([np.array([item]) for item in X_test])
+    d_mnist = dataset_class(X_train, y_train, X_test, y_test)
+    # if val:
+    #     d_mnist = mnist.MNIST(n_val=10000)
+    # else:
+    #     d_mnist = mnist.MNIST(n_val=0)
+    #
+    # d_mnist.train_X = d_mnist.train_X[:]
+    # d_mnist.val_X = d_mnist.val_X[:]
+    # d_mnist.test_X = d_mnist.test_X[:]
+    # d_mnist.train_y = d_mnist.train_y[:]
+    # d_mnist.val_y = d_mnist.val_y[:]
+    # d_mnist.test_y = d_mnist.test_y[:]
 
     if downscale_x != 1:
         d_mnist.train_X = downscale_local_mean(d_mnist.train_X, (1, 1, 1, downscale_x))
@@ -93,7 +109,7 @@ def load_mnist(invert=False, zero_centre=False, intensity_scale=1.0, val=False, 
         px = (32 - d_mnist.train_X.shape[3]) // 2
         # Pad 28x28 to 32x32
         d_mnist.train_X = np.pad(d_mnist.train_X, [(0 ,0), (0 ,0), (py ,py), (px ,px)], mode='constant')
-        d_mnist.val_X = np.pad(d_mnist.val_X, [(0 ,0), (0 ,0), (py ,py), (px ,px)], mode='constant')
+        # d_mnist.val_X = np.pad(d_mnist.val_X, [(0 ,0), (0 ,0), (py ,py), (px ,px)], mode='constant')
         d_mnist.test_X = np.pad(d_mnist.test_X, [(0 ,0), (0 ,0), (py ,py), (px ,px)], mode='constant')
 
     if invert:
