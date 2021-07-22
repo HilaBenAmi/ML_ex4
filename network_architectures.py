@@ -1,10 +1,8 @@
-from collections import OrderedDict
-import math
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn import init as nninit
-import torchvision.models as models, torchvision.models.resnet as resnet
+from torchvision.transforms import Resize, Grayscale
 
 _ARCH_REGISTRY = {}
 
@@ -21,9 +19,11 @@ def architecture(name, sample_shape):
     ...         # Build network
     ...         pass
     """
+
     def decorate(fn):
         _ARCH_REGISTRY[name] = (fn, sample_shape)
         return fn
+
     return decorate
 
 
@@ -40,9 +40,40 @@ def get_net_and_shape_for_architecture(arch_name):
     return _ARCH_REGISTRY[arch_name]
 
 
+@architecture('mnist-bn-32-32-64-256', (1, 32, 32))
+class MNIST_BN_32_32_64_256(nn.Module):
+    def __init__(self, n_classes):
+        super(MNIST_BN_32_32_64_256, self).__init__()
+        self.resize = Resize((28, 28))
+        self.conv1_1 = nn.Conv2d(1, 32, (5, 5))
+        self.conv1_1_bn = nn.BatchNorm2d(32)
+        self.pool1 = nn.MaxPool2d((2, 2))
+
+        self.conv2_1 = nn.Conv2d(32, 64, (3, 3))
+        self.conv2_1_bn = nn.BatchNorm2d(64)
+        self.conv2_2 = nn.Conv2d(64, 64, (3, 3))
+        self.conv2_2_bn = nn.BatchNorm2d(64)
+        self.pool2 = nn.MaxPool2d((2, 2))
+
+        self.drop1 = nn.Dropout()
+        self.fc3 = nn.Linear(1024, 256)
+        self.fc4 = nn.Linear(256, n_classes)
+
+    def forward(self, x):
+        x = self.resize(x)
+        x = self.pool1(F.relu(self.conv1_1_bn(self.conv1_1(x))))
+
+        x = F.relu(self.conv2_1_bn(self.conv2_1(x)))
+        x = self.pool2(F.relu(self.conv2_2_bn(self.conv2_2(x))))
+        x = x.view(-1, 1024)
+        x = self.drop1(x)
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
+
 
 @architecture('mnist-bn-32-64-256', (1, 28, 28))
-class MNIST_BN_32_64_256 (nn.Module):
+class MNIST_BN_32_64_256(nn.Module):
     def __init__(self, n_classes):
         super(MNIST_BN_32_64_256, self).__init__()
 
@@ -72,8 +103,42 @@ class MNIST_BN_32_64_256 (nn.Module):
         return x
 
 
+@architecture('mnist-bn-32-32-64-256-rgb', (3, 32, 32))
+class MNIST_BN_32_32_64_256_rgb(nn.Module):
+    def __init__(self, n_classes):
+        super(MNIST_BN_32_32_64_256_rgb, self).__init__()
+        self.resize = Resize((28, 28))
+        self.gray_scale = Grayscale()
+        self.conv1_1 = nn.Conv2d(1, 32, (5, 5))
+        self.conv1_1_bn = nn.BatchNorm2d(32)
+        self.pool1 = nn.MaxPool2d((2, 2))
+
+        self.conv2_1 = nn.Conv2d(32, 64, (3, 3))
+        self.conv2_1_bn = nn.BatchNorm2d(64)
+        self.conv2_2 = nn.Conv2d(64, 64, (3, 3))
+        self.conv2_2_bn = nn.BatchNorm2d(64)
+        self.pool2 = nn.MaxPool2d((2, 2))
+
+        self.drop1 = nn.Dropout()
+        self.fc3 = nn.Linear(1024, 256)
+        self.fc4 = nn.Linear(256, n_classes)
+
+    def forward(self, x):
+        x = self.gray_scale(x)
+        x = self.resize(x)
+        x = self.pool1(F.relu(self.conv1_1_bn(self.conv1_1(x))))
+
+        x = F.relu(self.conv2_1_bn(self.conv2_1(x)))
+        x = self.pool2(F.relu(self.conv2_2_bn(self.conv2_2(x))))
+        x = x.view(-1, 1024)
+        x = self.drop1(x)
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
+
+
 @architecture('grey-32-64-128-gp', (1, 32, 32))
-class Grey_32_64_128_gp (nn.Module):
+class Grey_32_64_128_gp(nn.Module):
     def __init__(self, n_classes):
         super(Grey_32_64_128_gp, self).__init__()
 
@@ -126,7 +191,7 @@ class Grey_32_64_128_gp (nn.Module):
 
 
 @architecture('grey-32-64-128-gp-wn', (1, 32, 32))
-class Grey_32_64_128_gp_wn (nn.Module):
+class Grey_32_64_128_gp_wn(nn.Module):
     def __init__(self, n_classes):
         super(Grey_32_64_128_gp_wn, self).__init__()
 
@@ -192,7 +257,7 @@ class Grey_32_64_128_gp_wn (nn.Module):
 
 
 @architecture('grey-32-64-128-gp-nonorm', (1, 32, 32))
-class Grey_32_64_128_gp_nonorm (nn.Module):
+class Grey_32_64_128_gp_nonorm(nn.Module):
     def __init__(self, n_classes):
         super(Grey_32_64_128_gp_nonorm, self).__init__()
 
@@ -248,7 +313,7 @@ class Grey_32_64_128_gp_nonorm (nn.Module):
 
 
 @architecture('rgb-48-96-192-gp', (3, 32, 32))
-class RGB_48_96_192_gp (nn.Module):
+class RGB_48_96_192_gp(nn.Module):
     def __init__(self, n_classes):
         super(RGB_48_96_192_gp, self).__init__()
 
@@ -355,7 +420,7 @@ class RGB_128_256_down_gp(nn.Module):
 
 
 @architecture('rgb40-48-96-192-384-gp', (3, 40, 40))
-class RGB40_48_96_192_384_gp (nn.Module):
+class RGB40_48_96_192_384_gp(nn.Module):
     def __init__(self, n_classes):
         super(RGB40_48_96_192_384_gp, self).__init__()
 
@@ -416,7 +481,7 @@ class RGB40_48_96_192_384_gp (nn.Module):
 
 
 @architecture('rgb40-96-192-384-gp', (3, 40, 40))
-class RGB40_96_192_384_gp (nn.Module):
+class RGB40_96_192_384_gp(nn.Module):
     def __init__(self, n_classes):
         super(RGB40_96_192_384_gp, self).__init__()
 
@@ -474,13 +539,16 @@ def robust_binary_crossentropy(pred, tgt):
     inv_pred = -pred + 1.0 + 1e-6
     return -(tgt * torch.log(pred + 1.0e-6) + inv_tgt * torch.log(inv_pred))
 
+
 def bugged_cls_bal_bce(pred, tgt):
     inv_tgt = -tgt + 1.0
     inv_pred = pred + 1.0 + 1e-6
     return -(tgt * torch.log(pred + 1.0e-6) + inv_tgt * torch.log(inv_pred))
 
+
 def log_cls_bal(pred, tgt):
     return -torch.log(pred + 1.0e-6)
+
 
 def get_cls_bal_function(name):
     if name == 'bce':

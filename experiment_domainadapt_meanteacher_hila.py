@@ -30,20 +30,22 @@ import os
 import pickle
 import cmdline_helpers
 
-INNER_K_FOLD = 2 # 3
+INNER_K_FOLD = 3 # 3
 OUTER_K_FOLD = 2 # 10
-num_epochs = 1 # 100
-bo_num_iter = 1  # 50
-init_points = 1
+num_epochs = 100 # 100
+bo_num_iter = 10  # 50
+init_points = 5
+PATIENCE = 5
+BEST_EPOCHS_LIST = []
 
 exp = 'mnist_svhn'
-log_file = f'results_exp_meanteacher_hila/log_{exp}_example_run.txt'
+log_file = f'results_exp_meanteacher_hila/log_{exp}_run.txt'
 model_file = ''
 
 seed = 0
 device = 'cpu'
 epoch_size = 'target'
-batch_size = 60
+batch_size = 30
 
 
 torch_device = torch.device(device)
@@ -74,9 +76,7 @@ def runner(exp):
         d_target = data_loaders.load_mnist(invert=False, zero_centre=False, pad32=True, val=False)
     elif exp == 'mnist_svhn':
         d_source = data_loaders.load_mnist(invert=False, zero_centre=False, pad32=True)
-        d_target = data_loaders.load_mnist(invert=False, zero_centre=False, pad32=True, val=False)
-
-        # d_target = data_loaders.load_svhn(zero_centre=False, greyscale=True, val=False)
+        d_target = data_loaders.load_svhn(zero_centre=False, greyscale=True, val=False)
     elif exp == 'svhn_mnist_rgb':
         d_source = data_loaders.load_svhn(zero_centre=False, greyscale=False)
         d_target = data_loaders.load_mnist(invert=False, zero_centre=False, pad32=True, val=False, rgb=True)
@@ -117,8 +117,8 @@ def runner(exp):
 
 def build_and_train_model(source_train_x_inner, source_train_y_inner, target_train_x_inner,
                 source_validation_x, source_validation_y, target_validation_x, target_validation_y,
-               confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_balance, learning_rate,
-               arch='', test_model=False, loss='var', double_softmax=False, fix_ema=False,
+               confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate,
+               rampup=0.0, arch='', test_model=False, loss='var', num_epochs=num_epochs, double_softmax=False, fix_ema=False,
                cls_bal_scale=False, cls_bal_scale_range=0.0, cls_balance_loss='bce',
                combine_batches=False, standardise_samples=False,
                src_affine_std=0.0, src_xlat_range=0.0, src_hflip=False,
@@ -367,8 +367,8 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
 
     # Report setttings
     log(f'confidence_thresh={confidence_thresh}, rampup={rampup}, teacher_alpha={teacher_alpha},\
-     unsup_weight={unsup_weight}, cls_balance={cls_balance}, learning_rate={learning_rate}')
-    # log('Settings: {}'.format(', '.join(['{}={}'.format(key, settings[key]) for key in sorted(list(settings.keys()))])))
+     unsup_weight={unsup_weight}, cls_balance={cls_balance}, learning_rate={learning_rate}, num_epochs={num_epochs}'
+        f'test_model={test_model}')
 
     print('Training...')
     sup_ds = data_source.ArrayDataSource([source_train_x_inner, source_train_y_inner], repeats=-1)
@@ -397,6 +397,10 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
 
     best_conf_mask_rate = 0.0
     best_src_test_err = 1.0
+    best_target_tea_err = 1.0
+    best_epoch = 0
+    count_no_improve = 0
+    count_no_improve_flag = False
     t_training_1 = time.time()
     for epoch in range(num_epochs):
         t1 = time.time()
@@ -429,8 +433,14 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
                 best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
                 improve = '*** '
                 best_target_tea_err = tgt_test_err_tea
+                best_epoch = epoch
+                if count_no_improve_flag:
+                    count_no_improve_flag = False
+                    count_no_improve = 0
             else:
                 improve = ''
+                count_no_improve_flag = True
+                count_no_improve += 1
         else:
             conf_mask_rate = train_res[-2]
             unsup_mask_rate = train_res[-1]
@@ -439,17 +449,24 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
                 improve = '*** '
                 best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
                 best_target_tea_err = tgt_test_err_tea
+                best_epoch = epoch
+                if count_no_improve_flag:
+                    count_no_improve_flag = False
+                    count_no_improve = 0
             else:
                 improve = ''
+                count_no_improve_flag = True
+                count_no_improve += 1
             unsup_loss_string = '{}, conf mask={:.3%}, unsup mask={:.3%}'.format(
                 unsup_loss_string, conf_mask_rate, unsup_mask_rate)
-
         t2 = time.time()
 
         log('{}Epoch {} took {:.2f}s: TRAIN clf loss={:.6f}, {}; '
             'SRC TEST ERR={:.3%}, TGT TEST student err={:.3%}, TGT TEST teacher err={:.3%}'.format(
             improve, epoch, t2 - t1, train_clf_loss, unsup_loss_string, src_test_err_stu, tgt_test_err_stu,
             tgt_test_err_tea))
+        if count_no_improve >= PATIENCE:
+            break
     t_training_2 = time.time()
     if test_model:
         t_inference_1 = time.time()
@@ -460,7 +477,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
         tgt_stu_scores_dict, tgt_tea_scores_dict = create_metrics_results(target_validation_y, tgt_pred_stu, tgt_pred_tea, tgt_prob_stu, tgt_prob_tea)
         inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred_stu)*1000
         return src_stu_scores_dict, src_tea_scores_dict, tgt_stu_scores_dict, tgt_tea_scores_dict, round(t_training_2-t_training_1, 3), inference_time_for_1000
-    return best_target_tea_err, best_teacher_model_state
+    return best_target_tea_err, best_teacher_model_state, best_epoch
 
 
 def calc_metrics(sup_y, sup_y_one_hot, pred_y, prob, class_labels):
@@ -503,32 +520,26 @@ def get_arch(exp, arch):
     if arch == '':
         if exp in {'mnist_usps', 'usps_mnist'}:
             arch = 'mnist-bn-32-64-256'
-        if exp in {'svhn_mnist', 'mnist_svhn'}:
-            arch = 'grey-32-64-128-gp'
+        elif exp in {'svhn_mnist', 'mnist_svhn'}:
+            arch = 'mnist-bn-32-32-64-256'
         if exp in {'cifar_stl', 'stl_cifar', 'syndigits_svhn', 'svhn_mnist_rgb', 'mnist_svhn_rgb'}:
-            arch = 'rgb-128-256-down-gp'
-        if exp in {'synsigns_gtsrb'}:
-            arch = 'rgb40-96-192-384-gp'
+            arch = 'mnist-bn-32-32-64-256-rgb'
+        #     arch = 'rgb-128-256-down-gp'
+        # if exp in {'synsigns_gtsrb'}:
+        #     arch = 'rgb40-96-192-384-gp'
     return arch
 
 
-def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_balance, learning_rate,
-               arch='', loss='var', double_softmax=False, fix_ema=False,
-               cls_bal_scale=False, cls_bal_scale_range=0.0, cls_balance_loss='bce',
-               combine_batches=False, standardise_samples=False,
-               src_affine_std=0.0, src_xlat_range=0.0, src_hflip=False,
-               src_intens_flip=False, src_gaussian_noise_std=0.0,
-               tgt_affine_std=0.0, tgt_xlat_range=0.0, tgt_hflip=False,
-               tgt_intens_flip='', tgt_gaussian_noise_std=0.0):
+def evaluate_exp(confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate, arch=''):
 
     arch = get_arch(exp, arch)
 
     cv_source = StratifiedKFold(n_splits=INNER_K_FOLD, shuffle=True)
     source_train_validation_list = []
-    for train_idx, validation_idx in cv_source.split(source_x, source_y):
+    for train_idx, validation_idx in cv_source.split(source_train_x, source_train_y):
         source_dict = {}
-        train_data, validation_data = source_x[train_idx], source_x[validation_idx]
-        train_target, validation_target = source_y[train_idx], source_y[validation_idx]
+        train_data, validation_data = source_train_x[train_idx], source_train_x[validation_idx]
+        train_target, validation_target = source_train_y[train_idx], source_train_y[validation_idx]
         source_dict['source_train_x'] = train_data
         source_dict['source_train_y'] = train_target
         source_dict['source_validation_x'] = validation_data
@@ -537,16 +548,17 @@ def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_bal
 
     cv_target = StratifiedKFold(n_splits=INNER_K_FOLD, shuffle=True)
     target_train_validation_list = []
-    for train_idx, validation_idx in cv_target.split(target_x, target_y):
+    for train_idx, validation_idx in cv_target.split(target_train_x, target_train_y):
         target_dict = {}
-        train_data, validation_data = target_x[train_idx], target_x[validation_idx]
-        validation_target = target_y[validation_idx]
+        train_data, validation_data = target_train_x[train_idx], target_train_x[validation_idx]
+        validation_target = target_train_y[validation_idx]
         target_dict['target_train_x'] = train_data
         target_dict['target_validation_x'] = validation_data
         target_dict['target_validation_y'] = validation_target
         target_train_validation_list.append(target_dict)
 
     target_test_err_list = []
+    best_epoch_list = []
     for cv_idx in range(INNER_K_FOLD):
         print(f'start inner cv {cv_idx}')
         log(f'start inner cv {cv_idx}')
@@ -566,12 +578,13 @@ def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_bal
             log('TARGET Train: X.shape={}'.format(target_train_x_inner.shape))
             log('TARGET Val: X.shape={}, y.shape={}'.format(target_validation_x.shape, target_validation_y.shape))
 
-        best_target_tea_err, best_teacher_model_state = build_and_train_model(
+        best_target_tea_err, best_teacher_model_state, best_epoch = build_and_train_model(
             source_train_x_inner, source_train_y_inner, target_train_x_inner,
             source_validation_x, source_validation_y, target_validation_x, target_validation_y,
-            confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_balance, learning_rate,
+            confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate,
             arch)
         target_test_err_list.append(best_target_tea_err)
+        best_epoch_list.append(best_epoch)
 
         # Save network
         if model_file != '':
@@ -579,15 +592,19 @@ def evaluate_exp(confidence_thresh, rampup, teacher_alpha, unsup_weight, cls_bal
             with open(model_file, 'wb') as f:
                 pickle.dump(best_teacher_model_state, f)
 
+    BEST_EPOCHS_LIST.append(int(np.mean(best_epoch_list)))
     return -np.mean(target_test_err_list)
 
 
 def rebuild_and_test_model(params, source_train_x, source_train_y, target_train_x, source_test_x,
                            source_test_y, target_test_x, target_test_y, arch=''):
+    log(f"Start rebuild on test set")
     arch = get_arch(exp, arch)
+    best_epoch = np.max(BEST_EPOCHS_LIST)
+    log(f'best_epoch: {best_epoch}')
     results = build_and_train_model(
         source_train_x, source_train_y, target_train_x, source_test_x, source_test_y, target_test_x, target_test_y,
-        arch=arch, test_model=True, **params)
+        arch=arch, test_model=True, num_epochs=best_epoch, **params)
     src_stu_scores_dict = results[0]
     src_tea_scores_dict = results[1]
     tgt_stu_scores_dict = results[2]
@@ -605,7 +622,7 @@ def rebuild_and_test_model(params, source_train_x, source_train_y, target_train_
 
 if __name__ == '__main__':
     # confidence_thresh = 0.96837722, rampup = 0.0, teacher_alpha = 0.99, unsup_weight = 3.0, cls_balance = 0.005, learning_rate = 0.001
-    global source_x, source_y, target_x, target_y, n_classes
+    global source_train_x, source_train_y, target_train_x, target_train_y
 
     source_x, source_y, target_x, target_y, n_classes = runner(exp=exp)
 
@@ -666,7 +683,7 @@ if __name__ == '__main__':
             log('TARGET Test: X.shape={}, y.shape={}'.format(target_test_x.shape, target_test_y.shape))
 
         domain_adapt_BO = BayesianOptimization(evaluate_exp, {'confidence_thresh': (0.5, 1.0),
-                                                            'rampup': (0.0, 100.0),
+                                                            # 'rampup': (0.0, 100.0),
                                                             'teacher_alpha': (0.5, 0.99),
                                                             'unsup_weight': (1.0, 3.0),
                                                             'cls_balance': (0.005, 0.01),
@@ -674,7 +691,8 @@ if __name__ == '__main__':
                                                             })
         domain_adapt_BO.maximize(init_points=init_points, n_iter=bo_num_iter)
         params_domain_adapt = domain_adapt_BO.max['params']
-        params_domain_adapt['rampup'] = round(params_domain_adapt['rampup'])
+        if 'rampup' in params_domain_adapt:
+            params_domain_adapt['rampup'] = round(params_domain_adapt['rampup'])
 
         log(f'outer CV {cv_idx} - Opt hyper params: {params_domain_adapt} \n with target of: {domain_adapt_BO.max["target"]}')
 
