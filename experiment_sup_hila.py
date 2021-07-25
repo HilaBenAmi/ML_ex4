@@ -24,17 +24,18 @@ from sklearn import metrics
 from sklearn.metrics import confusion_matrix
 
 import os
-import cmdline_helpers
+import pandas as pd
+import datetime
 
 INNER_K_FOLD = 2 # 3
 OUTER_K_FOLD = 2 # 10
 num_epochs = 1 # 100
-bo_num_iter = 10  # 50
-init_points = 6
+bo_num_iter = 2  # 50
+init_points = 2
 PATIENCE = 5
 BEST_EPOCHS_LIST = []
 
-exp = 'cifar_stl'
+exp = 'mnist_usps'
 log_file = f'results_exp_sup_hila/log_{exp}_example_run.txt'
 model_file = ''
 
@@ -248,7 +249,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
         src_scores_dict = create_metrics_results(source_validation_y, src_pred, src_prob)
         tgt_scores_dict = create_metrics_results(target_validation_y, tgt_pred, tgt_prob)
         inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred)*1000
-        return src_scores_dict, tgt_scores_dict, round(t_training_2-t_training_1, 3), inference_time_for_1000
+        return src_scores_dict, tgt_scores_dict, round(t_training_2-t_training_1, 3), round(inference_time_for_1000, 4)
     return best_src_test_err, best_epoch
 
 
@@ -261,20 +262,20 @@ def calc_metrics(sup_y, sup_y_one_hot, pred_y, prob, class_labels):
         tpr = conf[label][label] / sum(conf[label])
         tpr_list.append(tpr)
         fpr_numerator = sum([pred_row[label] for pred_row in conf]) - conf[label][label]
-        fpr_denominator = sum(conf) - sum(conf[label])
+        fpr_denominator = sum(sum(conf)) - sum(conf[label])
         fpr_list.append(fpr_numerator / fpr_denominator)
-    scores_dict['tpr'] = np.mean(tpr_list)
-    scores_dict['fpr'] = np.mean(fpr_list)
+    scores_dict['tpr'] = np.round(np.mean(tpr_list), 4)
+    scores_dict['fpr'] = np.round(np.mean(fpr_list), 4)
 
     # classification_report = metrics.classification_report(sup_y, pred_y, digits=3)
     # print(classification_report)
-    scores_dict['acc'] = metrics.accuracy_score(sup_y, pred_y)
-    scores_dict['roc_auc'] = metrics.roc_auc_score(sup_y, prob, multi_class='ovr')
-    scores_dict['recall'] = metrics.recall_score(sup_y, pred_y, average='macro')
-    scores_dict['precision'] = metrics.precision_score(sup_y, pred_y, average='macro')
+    scores_dict['acc'] = np.round(metrics.accuracy_score(sup_y, pred_y), 2)
+    scores_dict['roc_auc'] = np.round(metrics.roc_auc_score(sup_y, prob, multi_class='ovr'), 4)
+    # scores_dict['recall'] = metrics.recall_score(sup_y, pred_y, average='macro')
+    scores_dict['precision'] = np.round(metrics.precision_score(sup_y, pred_y, average='macro'), 4)
 
     pred_one_hot = label_binarize(pred_y, classes=class_labels)
-    scores_dict['recall_precision_auc'] = metrics.average_precision_score(sup_y_one_hot, pred_one_hot, average="macro")
+    scores_dict['recall_precision_auc'] = np.round(metrics.average_precision_score(sup_y_one_hot, pred_one_hot, average="macro"), 4)
     scores_dict['err'] = float((pred_y != sup_y).mean())
     return scores_dict
 
@@ -375,6 +376,10 @@ def rebuild_and_test_model(params, source_train_x, source_train_y, target_train_
     log(f'tgt_scores_dict: {tgt_scores_dict}')
     log(f'training_time: {training_time}')
     log(f'inference_time for 1000 instences: {inference_time}')
+    src_scores = pd.Series(src_scores_dict)
+    tgt_scores_dict.update({'training_time': training_time, 'inference_time': inference_time, 'params': params})
+    tgt_scores = pd.Series(tgt_scores_dict)
+    return src_scores, tgt_scores
 
 
 if __name__ == '__main__':
@@ -412,33 +417,47 @@ if __name__ == '__main__':
         target_dict['target_test_y'] = test_target[:500]
         target_train_test_list.append(target_dict)
 
-    target_test_err_list = []
-    for cv_idx in range(OUTER_K_FOLD):
-        print(f'start outer cv {cv_idx}')
-        log(f'start outer cv {cv_idx}')
-        source_train_x = source_train_test_list[cv_idx]['source_train_x']
-        source_train_y = source_train_test_list[cv_idx]['source_train_y']
-        source_test_x = source_train_test_list[cv_idx]['source_test_x']
-        source_test_y = source_train_test_list[cv_idx]['source_test_y']
-        target_train_x = target_train_test_list[cv_idx]['target_train_x']
-        target_train_y = target_train_test_list[cv_idx]['target_train_y']
-        target_test_x = target_train_test_list[cv_idx]['target_test_x']
-        target_test_y = target_train_test_list[cv_idx]['target_test_y']
+    src_scores_list = []
+    tgt_scores_list = []
+    try:
+        for cv_idx in range(OUTER_K_FOLD):
+            print(f'start outer cv {cv_idx}')
+            log(f'start outer cv {cv_idx}')
+            source_train_x = source_train_test_list[cv_idx]['source_train_x']
+            source_train_y = source_train_test_list[cv_idx]['source_train_y']
+            source_test_x = source_train_test_list[cv_idx]['source_test_x']
+            source_test_y = source_train_test_list[cv_idx]['source_test_y']
+            target_train_x = target_train_test_list[cv_idx]['target_train_x']
+            target_train_y = target_train_test_list[cv_idx]['target_train_y']
+            target_test_x = target_train_test_list[cv_idx]['target_test_x']
+            target_test_y = target_train_test_list[cv_idx]['target_test_y']
 
-        if cv_idx == 0:
-            # Report dataset size
-            log('Dataset:')
-            log('SOURCE Train: X.shape={}, y.shape={}'.format(source_train_x.shape, source_train_y.shape))
-            log('SOURCE Test: X.shape={}, y.shape={}'.format(source_test_x.shape, source_test_y.shape))
-            log('TARGET Train: X.shape={}'.format(target_train_x.shape))
-            log('TARGET Test: X.shape={}, y.shape={}'.format(target_test_x.shape, target_test_y.shape))
+            if cv_idx == 0:
+                # Report dataset size
+                log('Dataset:')
+                log('SOURCE Train: X.shape={}, y.shape={}'.format(source_train_x.shape, source_train_y.shape))
+                log('SOURCE Test: X.shape={}, y.shape={}'.format(source_test_x.shape, source_test_y.shape))
+                log('TARGET Train: X.shape={}'.format(target_train_x.shape))
+                log('TARGET Test: X.shape={}, y.shape={}'.format(target_test_x.shape, target_test_y.shape))
 
-        domain_adapt_BO = BayesianOptimization(evaluate_exp, {'learning_rate': (0.00001, 0.1)})
-        domain_adapt_BO.maximize(init_points=init_points, n_iter=bo_num_iter)
-        params_domain_adapt = domain_adapt_BO.max['params']
+            domain_adapt_BO = BayesianOptimization(evaluate_exp, {'learning_rate': (0.00001, 0.1)})
+            domain_adapt_BO.maximize(init_points=init_points, n_iter=bo_num_iter)
+            params_domain_adapt = domain_adapt_BO.max['params']
 
-        log(f'outer CV {cv_idx} - Opt hyper params: {params_domain_adapt} \n with target of: {domain_adapt_BO.max["target"]}')
+            log(f'outer CV {cv_idx} - Opt hyper params: {params_domain_adapt} \n with target of: {domain_adapt_BO.max["target"]}')
 
-        rebuild_and_test_model(params_domain_adapt, source_train_x, source_train_y, target_train_x, source_test_x,
-                           source_test_y, target_test_x, target_test_y)
-        log('*********************************************************************** \n')
+            src_scores, tgt_scores = rebuild_and_test_model(params_domain_adapt, source_train_x, source_train_y, target_train_x, source_test_x,
+                               source_test_y, target_test_x, target_test_y)
+            src_scores_list.append(src_scores)
+            tgt_scores_list.append(tgt_scores)
+            log('*********************************************************************** \n')
+    except Exception:
+        log(f"stopped at cv: {cv_idx}")
+        raise
+    finally:
+        if len(tgt_scores_list) > 0:
+            tgt_scores_df = pd.DataFrame(tgt_scores_list)
+            src_scores_df = pd.DataFrame(src_scores_list)
+            date = datetime.datetime.now().strftime('%d-%m_%H-%M')
+            tgt_scores_df.to_csv(f"./sup/tgt_scores_df_{exp}_until_cv_{cv_idx}_{date}.csv")
+            src_scores_df.to_csv(f"./sup/src_scores_df_{exp}_until_cv_{cv_idx}_{date}.csv")
