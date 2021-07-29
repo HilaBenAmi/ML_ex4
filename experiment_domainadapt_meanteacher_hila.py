@@ -11,7 +11,6 @@ import data_loaders
 from sklearn.model_selection import StratifiedKFold
 
 import time
-import math
 import numpy as np
 from batchup import data_source, work_pool
 import network_architectures
@@ -31,15 +30,15 @@ import datetime
 import pandas as pd
 import cmdline_helpers
 
-INNER_K_FOLD = 3 # 3
-OUTER_K_FOLD = 2 # 10
-num_epochs = 100 # 100
-bo_num_iter = 10  # 50
+INNER_K_FOLD = 3
+OUTER_K_FOLD = 10
+num_epochs = 100
+bo_num_iter = 50
 init_points = 5
 PATIENCE = 5
 BEST_EPOCHS_LIST = []
 
-exp = 'mnist_svhn'
+exp = 'syndigits-svhn'
 log_file = f'results_exp_meanteacher_hila/log_{exp}_run.txt'
 model_file = ''
 
@@ -118,21 +117,15 @@ def runner(exp):
 
 def build_and_train_model(source_train_x_inner, source_train_y_inner, target_train_x_inner,
                 source_validation_x, source_validation_y, target_validation_x, target_validation_y,
-               confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate,
-               rampup=0.0, arch='', test_model=False, loss='var', num_epochs=num_epochs, double_softmax=False, fix_ema=False,
-               cls_bal_scale=False, cls_bal_scale_range=0.0, cls_balance_loss='bce',
-               combine_batches=False, standardise_samples=False,
-               src_affine_std=0.0, src_xlat_range=0.0, src_hflip=False,
-               src_intens_flip=False, src_gaussian_noise_std=0.0,
-               tgt_affine_std=0.0, tgt_xlat_range=0.0, tgt_hflip=False,
+               confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate, arch='', test_model=False,
+               loss='var', num_epochs=num_epochs, cls_bal_scale=False, cls_bal_scale_range=0.0, cls_balance_loss='bce',
+               src_affine_std=0.0, src_xlat_range=0.0, src_hflip=False, src_intens_flip=False,
+               src_gaussian_noise_std=0.0, tgt_affine_std=0.0, tgt_xlat_range=0.0, tgt_hflip=False,
                tgt_intens_flip='', tgt_gaussian_noise_std=0.0):
 
     net_class, expected_shape = network_architectures.get_net_and_shape_for_architecture(arch)
 
     settings = locals().copy()
-    rampup = round(rampup)
-
-    use_rampup = rampup > 0.0
 
     src_intens_scale_range_lower, src_intens_scale_range_upper, src_intens_offset_range_lower, src_intens_offset_range_upper = \
         None, None, None, None
@@ -152,10 +145,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
         param.requires_grad = False
 
     student_optimizer = torch.optim.Adam(student_params, lr=learning_rate)
-    if fix_ema:
-        teacher_optimizer = optim_weight_ema.EMAWeightOptimizer(teacher_net, student_net, alpha=teacher_alpha)
-    else:
-        teacher_optimizer = optim_weight_ema.OldWeightEMA(teacher_net, student_net, alpha=teacher_alpha)
+    teacher_optimizer = optim_weight_ema.OldWeightEMA(teacher_net, student_net, alpha=teacher_alpha)
     classification_criterion = nn.CrossEntropyLoss()
 
     print('Built network')
@@ -177,16 +167,10 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
         gaussian_noise_std=tgt_gaussian_noise_std
     )
 
-    if combine_batches:
-        def augment(X_sup, y_src, X_tgt):
-            X_src_stu, X_src_tea = src_aug.augment_pair(X_sup)
-            X_tgt_stu, X_tgt_tea = tgt_aug.augment_pair(X_tgt)
-            return X_src_stu, X_src_tea, y_src, X_tgt_stu, X_tgt_tea
-    else:
-        def augment(X_src, y_src, X_tgt):
-            X_src = src_aug.augment(X_src)
-            X_tgt_stu, X_tgt_tea = tgt_aug.augment_pair(X_tgt)
-            return X_src, y_src, X_tgt_stu, X_tgt_tea
+    def augment(X_src, y_src, X_tgt):
+        X_src = src_aug.augment(X_src)
+        X_tgt_stu, X_tgt_tea = tgt_aug.augment_pair(X_tgt)
+        return X_src, y_src, X_tgt_stu, X_tgt_tea
 
     rampup_weight_in_list = [0]
 
@@ -194,14 +178,9 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
 
     def compute_aug_loss(stu_out, tea_out):
         # Augmentation loss
-        if use_rampup:
-            unsup_mask = None
-            conf_mask_count = None
-            unsup_mask_count = None
-        else:
-            conf_tea = torch.max(tea_out, 1)[0]
-            unsup_mask = conf_mask = (conf_tea > confidence_thresh).float()
-            unsup_mask_count = conf_mask_count = conf_mask.sum()
+        conf_tea = torch.max(tea_out, 1)[0]
+        unsup_mask = conf_mask = (conf_tea > confidence_thresh).float()
+        unsup_mask_count = conf_mask_count = conf_mask.sum()
 
         if loss == 'bce':
             aug_loss = network_architectures.robust_binary_crossentropy(stu_out, tea_out)
@@ -211,10 +190,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
 
         # Class balance scaling
         if cls_bal_scale:
-            if use_rampup:
-                n_samples = float(aug_loss.shape[0])
-            else:
-                n_samples = unsup_mask.sum()
+            n_samples = unsup_mask.sum()
             avg_pred = n_samples / float(n_classes)
             bal_scale = avg_pred / torch.clamp(tea_out.sum(dim=0), min=1.0)
             if cls_bal_scale_range != 0.0:
@@ -223,11 +199,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
             aug_loss = aug_loss * bal_scale[None, :]
 
         aug_loss = aug_loss.mean(dim=1)
-
-        if use_rampup:
-            unsup_loss = aug_loss.mean() * rampup_weight_in_list[0]
-        else:
-            unsup_loss = (aug_loss * unsup_mask).mean()
+        unsup_loss = (aug_loss * unsup_mask).mean()
 
         # Class balance loss
         if cls_balance > 0.0:
@@ -236,110 +208,43 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
             avg_cls_prob = stu_out.mean(dim=0)
             # Compute loss
             equalise_cls_loss = cls_bal_fn(avg_cls_prob, float(1.0 / n_classes))
-
             equalise_cls_loss = equalise_cls_loss.mean() * n_classes
-
-            if use_rampup:
-                equalise_cls_loss = equalise_cls_loss * rampup_weight_in_list[0]
-            else:
-                if rampup == 0:
-                    equalise_cls_loss = equalise_cls_loss * unsup_mask.mean(dim=0)
-
+            equalise_cls_loss = equalise_cls_loss * unsup_mask.mean(dim=0)
             unsup_loss += equalise_cls_loss * cls_balance
 
         return unsup_loss, conf_mask_count, unsup_mask_count
 
-    if combine_batches:
-        def f_train(X_src0, X_src1, y_src, X_tgt0, X_tgt1):
-            X_src0 = torch.tensor(X_src0, dtype=torch.float, device=torch_device)
-            X_src1 = torch.tensor(X_src1, dtype=torch.float, device=torch_device)
-            y_src = torch.tensor(y_src, dtype=torch.long, device=torch_device)
-            X_tgt0 = torch.tensor(X_tgt0, dtype=torch.float, device=torch_device)
-            X_tgt1 = torch.tensor(X_tgt1, dtype=torch.float, device=torch_device)
+    def f_train(X_src, y_src, X_tgt0, X_tgt1):
+        X_src = torch.tensor(X_src, dtype=torch.float, device=torch_device)
+        y_src = torch.tensor(y_src, dtype=torch.long, device=torch_device)
+        X_tgt0 = torch.tensor(X_tgt0, dtype=torch.float, device=torch_device)
+        X_tgt1 = torch.tensor(X_tgt1, dtype=torch.float, device=torch_device)
 
-            n_samples = X_src0.size()[0]
-            n_total = n_samples + X_tgt0.size()[0]
+        student_optimizer.zero_grad()
+        student_net.train()
+        teacher_net.train()
 
-            student_optimizer.zero_grad()
-            student_net.train()
-            teacher_net.train()
+        src_logits_out = student_net(X_src)
+        student_tgt_logits_out = student_net(X_tgt0)
+        student_tgt_prob_out = F.softmax(student_tgt_logits_out, dim=1)
+        teacher_tgt_logits_out = teacher_net(X_tgt1)
+        teacher_tgt_prob_out = F.softmax(teacher_tgt_logits_out, dim=1)
 
-            # Concatenate source and target mini-batches
-            X0 = torch.cat([X_src0, X_tgt0], 0)
-            X1 = torch.cat([X_src1, X_tgt1], 0)
+        # Supervised classification loss
+        clf_loss = classification_criterion(src_logits_out, y_src)
 
-            student_logits_out = student_net(X0)
-            student_prob_out = F.softmax(student_logits_out, dim=1)
+        unsup_loss, conf_mask_count, unsup_mask_count = compute_aug_loss(student_tgt_prob_out, teacher_tgt_prob_out)
 
-            src_logits_out = student_logits_out[:n_samples]
-            src_prob_out = student_prob_out[:n_samples]
+        loss_expr = clf_loss + unsup_loss * unsup_weight
 
-            teacher_logits_out = teacher_net(X1)
-            teacher_prob_out = F.softmax(teacher_logits_out, dim=1)
+        loss_expr.backward()
+        student_optimizer.step()
+        teacher_optimizer.step()
 
-            # Supervised classification loss
-            if double_softmax:
-                clf_loss = classification_criterion(src_prob_out, y_src)
-            else:
-                clf_loss = classification_criterion(src_logits_out, y_src)
+        n_samples = X_src.size()[0]
 
-            unsup_loss, conf_mask_count, unsup_mask_count = compute_aug_loss(student_prob_out, teacher_prob_out)
-
-            loss_expr = clf_loss + unsup_loss * unsup_weight
-
-            loss_expr.backward()
-            student_optimizer.step()
-            teacher_optimizer.step()
-
-            outputs = [float(clf_loss) * n_samples, float(unsup_loss) * n_total]
-            if not use_rampup:
-                mask_count = float(conf_mask_count) * 0.5
-                unsup_count = float(unsup_mask_count) * 0.5
-
-                outputs.append(mask_count)
-                outputs.append(unsup_count)
-            return tuple(outputs)
-    else:
-        def f_train(X_src, y_src, X_tgt0, X_tgt1):
-            X_src = torch.tensor(X_src, dtype=torch.float, device=torch_device)
-            y_src = torch.tensor(y_src, dtype=torch.long, device=torch_device)
-            X_tgt0 = torch.tensor(X_tgt0, dtype=torch.float, device=torch_device)
-            X_tgt1 = torch.tensor(X_tgt1, dtype=torch.float, device=torch_device)
-
-            student_optimizer.zero_grad()
-            student_net.train()
-            teacher_net.train()
-
-            src_logits_out = student_net(X_src)
-            student_tgt_logits_out = student_net(X_tgt0)
-            student_tgt_prob_out = F.softmax(student_tgt_logits_out, dim=1)
-            teacher_tgt_logits_out = teacher_net(X_tgt1)
-            teacher_tgt_prob_out = F.softmax(teacher_tgt_logits_out, dim=1)
-
-            # Supervised classification loss
-            if double_softmax:
-                clf_loss = classification_criterion(F.softmax(src_logits_out, dim=1), y_src)
-            else:
-                clf_loss = classification_criterion(src_logits_out, y_src)
-
-            unsup_loss, conf_mask_count, unsup_mask_count = compute_aug_loss(student_tgt_prob_out, teacher_tgt_prob_out)
-
-            loss_expr = clf_loss + unsup_loss * unsup_weight
-
-            loss_expr.backward()
-            student_optimizer.step()
-            teacher_optimizer.step()
-
-            n_samples = X_src.size()[0]
-
-            outputs = [float(clf_loss) * n_samples, float(unsup_loss) * n_samples]
-            if not use_rampup:
-                mask_count = float(conf_mask_count)
-                unsup_count = float(unsup_mask_count)
-
-                outputs.append(mask_count)
-                outputs.append(unsup_count)
-            return tuple(outputs)
+        outputs = [float(clf_loss) * n_samples, float(unsup_loss) * n_samples]
+        return tuple(outputs)
 
     print('Compiled training function')
 
@@ -367,7 +272,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
     cmdline_helpers.ensure_containing_dir_exists(log_file)
 
     # Report setttings
-    log(f'confidence_thresh={confidence_thresh}, rampup={rampup}, teacher_alpha={teacher_alpha},\
+    log(f'confidence_thresh={confidence_thresh}, teacher_alpha={teacher_alpha},\
      unsup_weight={unsup_weight}, cls_balance={cls_balance}, learning_rate={learning_rate}, num_epochs={num_epochs}'
         f'test_model={test_model}')
 
@@ -405,61 +310,30 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
     t_training_1 = time.time()
     for epoch in range(num_epochs):
         t1 = time.time()
-
-        if use_rampup:
-            if epoch < rampup:
-                p = max(0.0, float(epoch)) / float(rampup)
-                p = 1.0 - p
-                rampup_value = math.exp(-p * p * 5.0)
-            else:
-                rampup_value = 1.0
-
-            rampup_weight_in_list[0] = rampup_value
-
         train_res = data_source.batch_map_mean(f_train, train_batch_iter, n_batches=n_train_batches)
-
         train_clf_loss = train_res[0]
-        if combine_batches:
-            unsup_loss_string = 'unsup (both) loss={:.6f}'.format(train_res[1])
-        else:
-            unsup_loss_string = 'unsup (tgt) loss={:.6f}'.format(train_res[1])
+        unsup_loss_string = 'unsup (tgt) loss={:.6f}'.format(train_res[1])
 
         src_test_err_stu, src_test_err_tea = source_test_ds.batch_map_mean(f_eval, batch_size=batch_size * 2)
         tgt_test_err_stu, tgt_test_err_tea = target_test_ds.batch_map_mean(f_eval, batch_size=batch_size * 2)
 
-        if use_rampup:
-            unsup_loss_string = '{}, rampup={:.3%}'.format(unsup_loss_string, rampup_value)
-            if src_test_err_stu < best_src_test_err:
-                best_src_test_err = src_test_err_stu
-                best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
-                improve = '*** '
-                best_target_tea_err = tgt_test_err_tea
-                best_epoch = epoch
-                if count_no_improve_flag:
-                    count_no_improve_flag = False
-                    count_no_improve = 0
-            else:
-                improve = ''
-                count_no_improve_flag = True
-                count_no_improve += 1
+        conf_mask_rate = train_res[-2]
+        unsup_mask_rate = train_res[-1]
+        if conf_mask_rate > best_conf_mask_rate:
+            best_conf_mask_rate = conf_mask_rate
+            improve = '*** '
+            best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
+            best_target_tea_err = tgt_test_err_tea
+            best_epoch = epoch
+            if count_no_improve_flag:
+                count_no_improve_flag = False
+                count_no_improve = 0
         else:
-            conf_mask_rate = train_res[-2]
-            unsup_mask_rate = train_res[-1]
-            if conf_mask_rate > best_conf_mask_rate:
-                best_conf_mask_rate = conf_mask_rate
-                improve = '*** '
-                best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
-                best_target_tea_err = tgt_test_err_tea
-                best_epoch = epoch
-                if count_no_improve_flag:
-                    count_no_improve_flag = False
-                    count_no_improve = 0
-            else:
-                improve = ''
-                count_no_improve_flag = True
-                count_no_improve += 1
-            unsup_loss_string = '{}, conf mask={:.3%}, unsup mask={:.3%}'.format(
-                unsup_loss_string, conf_mask_rate, unsup_mask_rate)
+            improve = ''
+            count_no_improve_flag = True
+            count_no_improve += 1
+        unsup_loss_string = '{}, conf mask={:.3%}, unsup mask={:.3%}'.format(
+            unsup_loss_string, conf_mask_rate, unsup_mask_rate)
         t2 = time.time()
 
         log('{}Epoch {} took {:.2f}s: TRAIN clf loss={:.6f}, {}; '
@@ -476,7 +350,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
         tgt_pred_stu, tgt_pred_tea, tgt_prob_stu, tgt_prob_tea = target_test_ds.batch_map_concat(f_pred_for_metrics, batch_size=batch_size * 2)
         src_stu_scores_dict, src_tea_scores_dict = create_metrics_results(source_validation_y, src_pred_stu, src_pred_tea, src_prob_stu, src_prob_tea)
         tgt_stu_scores_dict, tgt_tea_scores_dict = create_metrics_results(target_validation_y, tgt_pred_stu, tgt_pred_tea, tgt_prob_stu, tgt_prob_tea)
-        inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred_stu)*1000
+        inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred_stu)*2  ## each test batch contains 500 samples
         return src_stu_scores_dict, src_tea_scores_dict, tgt_stu_scores_dict, tgt_tea_scores_dict, round(t_training_2-t_training_1, 3), round(inference_time_for_1000, 4)
     return best_target_tea_err, best_teacher_model_state, best_epoch
 
@@ -495,11 +369,8 @@ def calc_metrics(sup_y, sup_y_one_hot, pred_y, prob, class_labels):
     scores_dict['tpr'] = np.round(np.mean(tpr_list), 4)
     scores_dict['fpr'] = np.round(np.mean(fpr_list), 4)
 
-    # classification_report = metrics.classification_report(sup_y, pred_y, digits=3)
-    # print(classification_report)
     scores_dict['acc'] = np.round(metrics.accuracy_score(sup_y, pred_y), 2)
     scores_dict['roc_auc'] = np.round(metrics.roc_auc_score(sup_y, prob, multi_class='ovr'), 4)
-    # scores_dict['recall'] = metrics.recall_score(sup_y, pred_y, average='macro')
     scores_dict['precision'] = np.round(metrics.precision_score(sup_y, pred_y, average='macro'), 4)
 
     pred_one_hot = label_binarize(pred_y, classes=class_labels)
@@ -516,7 +387,6 @@ def create_metrics_results(sup_y, pred_stu, pred_tea, prob_stu, prob_tea):
     return stu_scores_dict, tea_scores_dict
 
 
-
 def get_arch(exp, arch):
     if arch == '':
         if exp in {'mnist_usps', 'usps_mnist'}:
@@ -525,14 +395,12 @@ def get_arch(exp, arch):
             arch = 'mnist-bn-32-32-64-256'
         if exp in {'cifar_stl', 'stl_cifar', 'syndigits_svhn', 'svhn_mnist_rgb', 'mnist_svhn_rgb'}:
             arch = 'mnist-bn-32-32-64-256-rgb'
-        #     arch = 'rgb-128-256-down-gp'
         # if exp in {'synsigns_gtsrb'}:
         #     arch = 'rgb40-96-192-384-gp'
     return arch
 
 
 def evaluate_exp(confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate, arch=''):
-
     arch = get_arch(exp, arch)
 
     cv_source = StratifiedKFold(n_splits=INNER_K_FOLD, shuffle=True)
@@ -624,7 +492,8 @@ def rebuild_and_test_model(params, source_train_x, source_train_y, target_train_
 
 
 if __name__ == '__main__':
-    # confidence_thresh = 0.96837722, rampup = 0.0, teacher_alpha = 0.99, unsup_weight = 3.0, cls_balance = 0.005, learning_rate = 0.001
+    # The hyper-parameters that got in the paper
+    # confidence_thresh = 0.96837722, teacher_alpha = 0.99, unsup_weight = 3.0, cls_balance = 0.005, learning_rate = 0.001
     global source_train_x, source_train_y, target_train_x, target_train_y
 
     source_x, source_y, target_x, target_y, n_classes = runner(exp=exp)
@@ -634,12 +503,6 @@ if __name__ == '__main__':
     elif log_file == 'none':
         log_file = None
 
-    # if log_file is not None:
-    #     if os.path.exists(log_file):
-    #         msg = 'Output log file {} already exists'.format(log_file)
-    #         print(msg)
-    #         raise Exception(msg)
-
     cv_source = StratifiedKFold(n_splits=OUTER_K_FOLD, shuffle=True)
     source_train_test_list = []
     for train_idx, test_idx in cv_source.split(source_x, source_y):
@@ -648,8 +511,8 @@ if __name__ == '__main__':
         train_target, test_target = source_y[train_idx], source_y[test_idx]
         source_dict['source_train_x'] = train_data[:1000]
         source_dict['source_train_y'] = train_target[:1000]
-        source_dict['source_test_x'] = test_data[:500]
-        source_dict['source_test_y'] = test_target[:500]
+        source_dict['source_test_x'] = test_data[:300]
+        source_dict['source_test_y'] = test_target[:300]
         source_train_test_list.append(source_dict)
 
     cv_target = StratifiedKFold(n_splits=OUTER_K_FOLD, shuffle=True)
@@ -660,8 +523,8 @@ if __name__ == '__main__':
         train_target, test_target = target_y[train_idx], target_y[test_idx]
         target_dict['target_train_x'] = train_data[:1000]
         target_dict['target_train_y'] = train_target[:1000]
-        target_dict['target_test_x'] = test_data[:500]
-        target_dict['target_test_y'] = test_target[:500]
+        target_dict['target_test_x'] = test_data[:300]
+        target_dict['target_test_y'] = test_target[:300]
         target_train_test_list.append(target_dict)
 
     tgt_scores_list = []

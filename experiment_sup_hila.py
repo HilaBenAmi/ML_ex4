@@ -27,15 +27,15 @@ import os
 import pandas as pd
 import datetime
 
-INNER_K_FOLD = 2 # 3
-OUTER_K_FOLD = 2 # 10
-num_epochs = 1 # 100
-bo_num_iter = 2  # 50
-init_points = 2
+INNER_K_FOLD = 3 # 3
+OUTER_K_FOLD = 10 # 10
+num_epochs = 100 # 100
+bo_num_iter = 20  # 50
+init_points = 5
 PATIENCE = 5
 BEST_EPOCHS_LIST = []
 
-exp = 'mnist_usps'
+exp = 'syndigits_svhn'
 log_file = f'results_exp_sup_hila/log_{exp}_example_run.txt'
 model_file = ''
 
@@ -92,8 +92,11 @@ def runner(exp):
         d_source = data_loaders.load_usps(zero_centre=False, scale28=True)
         d_target = data_loaders.load_mnist(zero_centre=False, val=False)
     elif exp == 'syndigits_svhn':
-        d_source = data_loaders.load_syn_digits(zero_centre=False)
         d_target = data_loaders.load_svhn(zero_centre=False, val=False)
+        d_source = data_loaders.load_syn_digits(zero_centre=False)
+    elif exp == 'svhn_syndigits':
+        d_source = data_loaders.load_svhn(zero_centre=False, val=False)
+        d_target = data_loaders.load_syn_digits(zero_centre=False)
     elif exp == 'synsigns_gtsrb':
         d_source = data_loaders.load_syn_signs(zero_centre=False)
         d_target = data_loaders.load_gtsrb(zero_centre=False, val=False)
@@ -248,7 +251,7 @@ def build_and_train_model(source_train_x_inner, source_train_y_inner, target_tra
         tgt_pred, tgt_prob = target_test_ds.batch_map_concat(f_pred_for_metrics, batch_size=batch_size * 4)
         src_scores_dict = create_metrics_results(source_validation_y, src_pred, src_prob)
         tgt_scores_dict = create_metrics_results(target_validation_y, tgt_pred, tgt_prob)
-        inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred)*1000
+        inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred)*2  ## each test batch contains 500 samples
         return src_scores_dict, tgt_scores_dict, round(t_training_2-t_training_1, 3), round(inference_time_for_1000, 4)
     return best_src_test_err, best_epoch
 
@@ -401,8 +404,8 @@ if __name__ == '__main__':
         train_target, test_target = source_y[train_idx], source_y[test_idx]
         source_dict['source_train_x'] = train_data[:1000]
         source_dict['source_train_y'] = train_target[:1000]
-        source_dict['source_test_x'] = test_data[:500]
-        source_dict['source_test_y'] = test_target[:500]
+        source_dict['source_test_x'] = test_data[:300]
+        source_dict['source_test_y'] = test_target[:300]
         source_train_test_list.append(source_dict)
 
     cv_target = StratifiedKFold(n_splits=OUTER_K_FOLD, shuffle=True)
@@ -413,8 +416,8 @@ if __name__ == '__main__':
         train_target, test_target = target_y[train_idx], target_y[test_idx]
         target_dict['target_train_x'] = train_data[:1000]
         target_dict['target_train_y'] = train_target[:1000]
-        target_dict['target_test_x'] = test_data[:500]
-        target_dict['target_test_y'] = test_target[:500]
+        target_dict['target_test_x'] = test_data[:300]
+        target_dict['target_test_y'] = test_target[:300]
         target_train_test_list.append(target_dict)
 
     src_scores_list = []

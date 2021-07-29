@@ -389,37 +389,47 @@ def load_syn_digits(zero_centre=False, greyscale=False, val=False):
     #
     #
 
+    import scipy
     print('Loading Syn-digits...')
-    if val:
-        d_synd = domain_datasets.SynDigits(n_val=10000)
-    else:
-        d_synd = domain_datasets.SynDigits(n_val=0)
+    path = f"./data/synthdigits"
+    test_mat = scipy.io.loadmat(f'{path}/synth_test_32x32_small.mat')
+    train_mat = scipy.io.loadmat(f'{path}/synth_train_32x32_small.mat')
+    X_train = np.transpose(train_mat['X'], (3, 2, 1, 0))
+    X_test = np.transpose(test_mat['X'], (3, 2, 1, 0))
+    y_train = np.array([item[0] for item in train_mat['y']])
+    y_test = np.array([item[0] for item in test_mat['y']])
+    d_synd = dataset_class(X_train, y_train, X_test, y_test)
 
-    d_synd.train_X = d_synd.train_X[:]
-    d_synd.val_X = d_synd.val_X[:]
-    d_synd.test_X = d_synd.test_X[:]
-    d_synd.train_y = d_synd.train_y[:]
-    d_synd.val_y = d_synd.val_y[:]
-    d_synd.test_y = d_synd.test_y[:]
+    # if val:
+    #     d_synd = domain_datasets.SynDigits(n_val=10000)
+    # else:
+    #     d_synd = domain_datasets.SynDigits(n_val=0)
+    #
+    # d_synd.train_X = d_synd.train_X[:]
+    # d_synd.val_X = d_synd.val_X[:]
+    # d_synd.test_X = d_synd.test_X[:]
+    # d_synd.train_y = d_synd.train_y[:]
+    # d_synd.val_y = d_synd.val_y[:]
+    # d_synd.test_y = d_synd.test_y[:]
 
-    if greyscale:
-        d_synd.train_X = rgb2grey_tensor(d_synd.train_X)
-        d_synd.val_X = rgb2grey_tensor(d_synd.val_X)
-        d_synd.test_X = rgb2grey_tensor(d_synd.test_X)
+    # if greyscale:
+    #     d_synd.train_X = rgb2grey_tensor(d_synd.train_X)
+    #     d_synd.val_X = rgb2grey_tensor(d_synd.val_X)
+    #     d_synd.test_X = rgb2grey_tensor(d_synd.test_X)
+    #
+    # if zero_centre:
+    #     d_synd.train_X = d_synd.train_X * 2.0 - 1.0
+    #     d_synd.val_X = d_synd.val_X * 2.0 - 1.0
+    #     d_synd.test_X = d_synd.test_X * 2.0 - 1.0
+    #
+    # print('SynDigits: train: X.shape={}, y.shape={}, val: X.shape={}, y.shape={}, test: X.shape={}, y.shape={}'.format(
+    #     d_synd.train_X.shape, d_synd.train_y.shape, d_synd.val_X.shape, d_synd.val_y.shape, d_synd.test_X.shape,
+    #     d_synd.test_y.shape))
+    #
+    # print('SynDigits: train: X.min={}, X.max={}'.format(
+    #     d_synd.train_X.min(), d_synd.train_X.max()))
 
-    if zero_centre:
-        d_synd.train_X = d_synd.train_X * 2.0 - 1.0
-        d_synd.val_X = d_synd.val_X * 2.0 - 1.0
-        d_synd.test_X = d_synd.test_X * 2.0 - 1.0
-
-    print('SynDigits: train: X.shape={}, y.shape={}, val: X.shape={}, y.shape={}, test: X.shape={}, y.shape={}'.format(
-        d_synd.train_X.shape, d_synd.train_y.shape, d_synd.val_X.shape, d_synd.val_y.shape, d_synd.test_X.shape,
-        d_synd.test_y.shape))
-
-    print('SynDigits: train: X.min={}, X.max={}'.format(
-        d_synd.train_X.min(), d_synd.train_X.max()))
-
-    d_synd.n_classes = 10
+    d_synd.n_classes = len(np.unique(d_synd.train_y))
 
     return d_synd
 
