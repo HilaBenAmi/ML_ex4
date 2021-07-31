@@ -6,129 +6,75 @@ Antti Tarvainen, Harri Valpola
 https://arxiv.org/abs/1703.01780
 
 """
-import click
+from bayes_opt import BayesianOptimization
+import data_loaders
+from sklearn.model_selection import StratifiedKFold
+
+import time
+import numpy as np
+from batchup import data_source, work_pool
+import network_architectures
+import augmentation
+import torch, torch.cuda
+from torch import nn
+from torch.nn import functional as F
+import optim_weight_ema
+
+from sklearn.preprocessing import label_binarize
+from sklearn import metrics
+from sklearn.metrics import confusion_matrix
+
+import os
+import pickle
+import datetime
+import pandas as pd
+import cmdline_helpers
+import argparse
+
+INNER_K_FOLD = 3
+OUTER_K_FOLD = 10
+num_epochs = 100
+bo_num_iter = 50
+init_points = 5
+PATIENCE = 5
+BEST_EPOCHS_LIST = []
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--exp', type=str, default='syndigits_svhn')
+args = parser.parse_args()
+exp = args.exp
+
+log_file = f'results_exp_meanteacher_hila/log_{exp}_run.txt'
+model_file = ''
+
+seed = 0
+device = 'cpu'
+epoch_size = 'target'
+batch_size = 30
 
 
-@click.command()
-@click.option('--exp', type=click.Choice(['svhn_mnist', 'mnist_svhn',
-                                          'svhn_mnist_rgb', 'mnist_svhn_rgb',
-                                          'cifar_stl', 'stl_cifar',
-                                          'mnist_usps', 'usps_mnist',
-                                          'syndigits_svhn',
-                                          'synsigns_gtsrb',
-                                          ]), default='mnist_svhn',
-              help='experiment to run')
-@click.option('--arch', type=click.Choice([
-    '',
-    'mnist-bn-32-64-256',
-    'grey-32-64-128-gp', 'grey-32-64-128-gp-wn', 'grey-32-64-128-gp-nonorm',
-    'rgb-128-256-down-gp', 'resnet18-32',
-    'rgb40-48-96-192-384-gp', 'rgb40-96-192-384-gp',
-]), default='', help='network architecture')
-@click.option('--loss', type=click.Choice(['var', 'bce']), default='var',
-              help='augmentation variance loss function')
-@click.option('--double_softmax', is_flag=True, default=False, help='apply softmax twice to compute supervised loss')
-@click.option('--confidence_thresh', type=float, default=0.96837722, help='augmentation var loss confidence threshold')
-@click.option('--rampup', type=int, default=0, help='ramp-up length')
-@click.option('--teacher_alpha', type=float, default=0.99, help='Teacher EMA alpha (decay)')
-@click.option('--fix_ema', is_flag=True, default=False, help='Use fixed EMA')
-@click.option('--unsup_weight', type=float, default=3.0, help='unsupervised loss weight')
-@click.option('--cls_bal_scale', is_flag=True, default=False,
-              help='Enable scaling unsupervised loss to counteract class imbalance')
-@click.option('--cls_bal_scale_range', type=float, default=0.0,
-              help='If not 0, clamp class imbalance scale to between x and 1/x where x is this value')
-@click.option('--cls_balance', type=float, default=0.005,
-              help='Weight of class balancing component of unsupervised loss')
-@click.option('--cls_balance_loss', type=click.Choice(['bce', 'log', 'bug']), default='bce',
-              help='Class balancing loss function')
-@click.option('--combine_batches', is_flag=True, default=False,
-              help='Build batches from both source and target samples')
-@click.option('--learning_rate', type=float, default=0.001, help='learning rate (Adam)')
-@click.option('--standardise_samples', default=False, is_flag=True, help='standardise samples (0 mean unit var)')
-@click.option('--src_affine_std', type=float, default=0.1, help='src aug xform: random affine transform std-dev')
-@click.option('--src_xlat_range', type=float, default=2.0, help='src aug xform: translation range')
-@click.option('--src_hflip', default=False, is_flag=True, help='src aug xform: enable random horizontal flips')
-@click.option('--src_intens_flip', is_flag=True, default=False,
-              help='src aug colour; enable intensity flip')
-@click.option('--src_intens_scale_range', type=str, default='',
-              help='src aug colour; intensity scale range `low:high` (-1.5:1.5 for mnist-svhn)')
-@click.option('--src_intens_offset_range', type=str, default='',
-              help='src aug colour; intensity offset range `low:high` (-0.5:0.5 for mnist-svhn)')
-@click.option('--src_gaussian_noise_std', type=float, default=0.1,
-              help='std aug: standard deviation of Gaussian noise to add to samples')
-@click.option('--tgt_affine_std', type=float, default=0.1, help='tgt aug xform: random affine transform std-dev')
-@click.option('--tgt_xlat_range', type=float, default=2.0, help='tgt aug xform: translation range')
-@click.option('--tgt_hflip', default=False, is_flag=True, help='tgt aug xform: enable random horizontal flips')
-@click.option('--tgt_intens_flip', is_flag=True, default=False,
-              help='tgt aug colour; enable intensity flip')
-@click.option('--tgt_intens_scale_range', type=str, default='',
-              help='tgt aug colour; intensity scale range `low:high` (-1.5:1.5 for mnist-svhn)')
-@click.option('--tgt_intens_offset_range', type=str, default='',
-              help='tgt aug colour; intensity offset range `low:high` (-0.5:0.5 for mnist-svhn)')
-@click.option('--tgt_gaussian_noise_std', type=float, default=0.1,
-              help='tgt aug: standard deviation of Gaussian noise to add to samples')
-@click.option('--num_epochs', type=int, default=200, help='number of epochs')
-@click.option('--batch_size', type=int, default=64, help='mini-batch size')
-@click.option('--epoch_size', type=click.Choice(['large', 'small', 'target']), default='target',
-              help='epoch size is either that of the smallest dataset, the largest, or the target')
-@click.option('--seed', type=int, default=0, help='random seed (0 for time-based)')
-@click.option('--log_file', type=str, default='', help='log file path (none to disable)')
-@click.option('--model_file', type=str, default='', help='model file path')
-@click.option('--device', type=str, default='cuda:0', help='Device')
-def experiment(exp, arch, loss, double_softmax, confidence_thresh, rampup, teacher_alpha, fix_ema,
-               unsup_weight, cls_bal_scale, cls_bal_scale_range, cls_balance, cls_balance_loss,
-               combine_batches,
-               learning_rate, standardise_samples,
-               src_affine_std, src_xlat_range, src_hflip,
-               src_intens_flip, src_intens_scale_range, src_intens_offset_range, src_gaussian_noise_std,
-               tgt_affine_std, tgt_xlat_range, tgt_hflip,
-               tgt_intens_flip, tgt_intens_scale_range, tgt_intens_offset_range, tgt_gaussian_noise_std,
-               num_epochs, batch_size, epoch_size, seed,
-               log_file, model_file, device):
-    settings = locals().copy()
+torch_device = torch.device(device)
+pool = work_pool.WorkerThreadPool(2)
 
-    import os
-    import sys
-    import pickle
-    import cmdline_helpers
-
-    if log_file == '':
-        log_file = 'output_aug_log_{}.txt'.format(exp)
-    elif log_file == 'none':
-        log_file = None
-
+# Setup output
+def log(text):
+    print(text)
     if log_file is not None:
-        if os.path.exists(log_file):
-            print('Output log file {} already exists'.format(log_file))
-            return
-
-    use_rampup = rampup > 0
-
-    src_intens_scale_range_lower, src_intens_scale_range_upper, src_intens_offset_range_lower, src_intens_offset_range_upper = \
-        cmdline_helpers.intens_aug_options(src_intens_scale_range, src_intens_offset_range)
-    tgt_intens_scale_range_lower, tgt_intens_scale_range_upper, tgt_intens_offset_range_lower, tgt_intens_offset_range_upper = \
-        cmdline_helpers.intens_aug_options(tgt_intens_scale_range, tgt_intens_offset_range)
+        with open(log_file, 'a') as f:
+            f.write(text + '\n')
+            f.flush()
+            f.close()
 
 
-    import time
-    import math
-    import numpy as np
-    from batchup import data_source, work_pool
-    import data_loaders
-    import standardisation
-    import network_architectures
-    import augmentation
-    import torch, torch.cuda
-    from torch import nn
-    from torch.nn import functional as F
-    import optim_weight_ema
-
-    torch_device = torch.device(device)
-    pool = work_pool.WorkerThreadPool(2)
+def ensure_containing_dir_exists(path):
+    dir_name = os.path.dirname(path)
+    if dir_name != '' and not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+    return path
 
 
-    n_chn = 0
-
+def load_data(exp):
+    settings = locals().copy()
 
     if exp == 'svhn_mnist':
         d_source = data_loaders.load_svhn(zero_centre=False, greyscale=True)
@@ -164,37 +110,37 @@ def experiment(exp, arch, loss, double_softmax, confidence_thresh, rampup, teach
         print('Unknown experiment type \'{}\''.format(exp))
         return
 
-    # Delete the training ground truths as we should not be using them
-    del d_target.train_y
-
-    if standardise_samples:
-        standardisation.standardise_dataset(d_source)
-        standardisation.standardise_dataset(d_target)
-
+    source_x = np.array(list(d_source.train_X[:]) + list(d_source.test_X[:]))
+    target_x = np.array(list(d_target.train_X[:]) + list(d_target.test_X[:]))
+    source_y = np.array(list(d_source.train_y[:]) + list(d_source.test_y[:]))
+    target_y = np.array(list(d_target.train_y[:]) + list(d_target.test_y[:]))
     n_classes = d_source.n_classes
 
     print('Loaded data')
+    return source_x, source_y, target_x, target_y, n_classes
 
 
-
-    if arch == '':
-        if exp in {'mnist_usps', 'usps_mnist'}:
-            arch = 'mnist-bn-32-64-256'
-        if exp in {'svhn_mnist', 'mnist_svhn'}:
-            arch = 'grey-32-64-128-gp'
-        if exp in {'cifar_stl', 'stl_cifar', 'syndigits_svhn', 'svhn_mnist_rgb', 'mnist_svhn_rgb'}:
-            arch = 'rgb-128-256-down-gp'
-        if exp in {'synsigns_gtsrb'}:
-            arch = 'rgb40-96-192-384-gp'
-
+def build_and_train_model(source_train_x_inner, source_train_y_inner, target_train_x_inner,
+                source_validation_x, source_validation_y, target_validation_x, target_validation_y,
+               confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate, arch='', test_model=False,
+               loss='var', num_epochs=num_epochs, cls_bal_scale=False, cls_bal_scale_range=0.0, cls_balance_loss='bce',
+               src_affine_std=0.0, src_xlat_range=0.0, src_hflip=False, src_intens_flip=False,
+               src_gaussian_noise_std=0.0, tgt_affine_std=0.0, tgt_xlat_range=0.0, tgt_hflip=False,
+               tgt_intens_flip='', tgt_gaussian_noise_std=0.0):
 
     net_class, expected_shape = network_architectures.get_net_and_shape_for_architecture(arch)
 
-    if expected_shape != d_source.train_X.shape[1:]:
-        print('Architecture {} not compatible with experiment {}; it needs samples of shape {}, '
-              'data has samples of shape {}'.format(arch, exp, expected_shape, d_source.train_X.shape[1:]))
-        return
+    settings = locals().copy()
 
+    src_intens_scale_range_lower, src_intens_scale_range_upper, src_intens_offset_range_lower, src_intens_offset_range_upper = \
+        None, None, None, None
+    tgt_intens_scale_range_lower, tgt_intens_scale_range_upper, tgt_intens_offset_range_lower, tgt_intens_offset_range_upper = \
+        None, None, None, None
+
+    if expected_shape != source_train_x_inner.shape[1:]:
+        print('Architecture {} not compatible with experiment {}; it needs samples of shape {}, '
+              'data has samples of shape {}'.format(arch, exp, expected_shape, source_train_x_inner.shape[1:]))
+        return
 
     student_net = net_class(n_classes).to(torch_device)
     teacher_net = net_class(n_classes).to(torch_device)
@@ -204,10 +150,7 @@ def experiment(exp, arch, loss, double_softmax, confidence_thresh, rampup, teach
         param.requires_grad = False
 
     student_optimizer = torch.optim.Adam(student_params, lr=learning_rate)
-    if fix_ema:
-        teacher_optimizer = optim_weight_ema.EMAWeightOptimizer(teacher_net, student_net, alpha=teacher_alpha)
-    else:
-        teacher_optimizer = optim_weight_ema.OldWeightEMA(teacher_net, student_net, alpha=teacher_alpha)
+    teacher_optimizer = optim_weight_ema.OldWeightEMA(teacher_net, student_net, alpha=teacher_alpha)
     classification_criterion = nn.CrossEntropyLoss()
 
     print('Built network')
@@ -229,34 +172,20 @@ def experiment(exp, arch, loss, double_softmax, confidence_thresh, rampup, teach
         gaussian_noise_std=tgt_gaussian_noise_std
     )
 
-    if combine_batches:
-        def augment(X_sup, y_src, X_tgt):
-            X_src_stu, X_src_tea = src_aug.augment_pair(X_sup)
-            X_tgt_stu, X_tgt_tea = tgt_aug.augment_pair(X_tgt)
-            return X_src_stu, X_src_tea, y_src, X_tgt_stu, X_tgt_tea
-    else:
-        def augment(X_src, y_src, X_tgt):
-            X_src = src_aug.augment(X_src)
-            X_tgt_stu, X_tgt_tea = tgt_aug.augment_pair(X_tgt)
-            return X_src, y_src, X_tgt_stu, X_tgt_tea
-
+    def augment(X_src, y_src, X_tgt):
+        X_src = src_aug.augment(X_src)
+        X_tgt_stu, X_tgt_tea = tgt_aug.augment_pair(X_tgt)
+        return X_src, y_src, X_tgt_stu, X_tgt_tea
 
     rampup_weight_in_list = [0]
 
-
     cls_bal_fn = network_architectures.get_cls_bal_function(cls_balance_loss)
-
 
     def compute_aug_loss(stu_out, tea_out):
         # Augmentation loss
-        if use_rampup:
-            unsup_mask = None
-            conf_mask_count = None
-            unsup_mask_count = None
-        else:
-            conf_tea = torch.max(tea_out, 1)[0]
-            unsup_mask = conf_mask = (conf_tea > confidence_thresh).float()
-            unsup_mask_count = conf_mask_count = conf_mask.sum()
+        conf_tea = torch.max(tea_out, 1)[0]
+        unsup_mask = conf_mask = (conf_tea > confidence_thresh).float()
+        unsup_mask_count = conf_mask_count = conf_mask.sum()
 
         if loss == 'bce':
             aug_loss = network_architectures.robust_binary_crossentropy(stu_out, tea_out)
@@ -266,23 +195,16 @@ def experiment(exp, arch, loss, double_softmax, confidence_thresh, rampup, teach
 
         # Class balance scaling
         if cls_bal_scale:
-            if use_rampup:
-                n_samples = float(aug_loss.shape[0])
-            else:
-                n_samples = unsup_mask.sum()
+            n_samples = unsup_mask.sum()
             avg_pred = n_samples / float(n_classes)
             bal_scale = avg_pred / torch.clamp(tea_out.sum(dim=0), min=1.0)
             if cls_bal_scale_range != 0.0:
-                bal_scale = torch.clamp(bal_scale, min=1.0/cls_bal_scale_range, max=cls_bal_scale_range)
+                bal_scale = torch.clamp(bal_scale, min=1.0 / cls_bal_scale_range, max=cls_bal_scale_range)
             bal_scale = bal_scale.detach()
             aug_loss = aug_loss * bal_scale[None, :]
 
         aug_loss = aug_loss.mean(dim=1)
-
-        if use_rampup:
-            unsup_loss = aug_loss.mean() * rampup_weight_in_list[0]
-        else:
-            unsup_loss = (aug_loss * unsup_mask).mean()
+        unsup_loss = (aug_loss * unsup_mask).mean()
 
         # Class balance loss
         if cls_balance > 0.0:
@@ -291,178 +213,89 @@ def experiment(exp, arch, loss, double_softmax, confidence_thresh, rampup, teach
             avg_cls_prob = stu_out.mean(dim=0)
             # Compute loss
             equalise_cls_loss = cls_bal_fn(avg_cls_prob, float(1.0 / n_classes))
-
             equalise_cls_loss = equalise_cls_loss.mean() * n_classes
-
-            if use_rampup:
-                equalise_cls_loss = equalise_cls_loss * rampup_weight_in_list[0]
-            else:
-                if rampup == 0:
-                    equalise_cls_loss = equalise_cls_loss * unsup_mask.mean(dim=0)
-
+            equalise_cls_loss = equalise_cls_loss * unsup_mask.mean(dim=0)
             unsup_loss += equalise_cls_loss * cls_balance
 
         return unsup_loss, conf_mask_count, unsup_mask_count
 
-    if combine_batches:
-        def f_train(X_src0, X_src1, y_src, X_tgt0, X_tgt1):
-            X_src0 = torch.tensor(X_src0, dtype=torch.float, device=torch_device)
-            X_src1 = torch.tensor(X_src1, dtype=torch.float, device=torch_device)
-            y_src = torch.tensor(y_src, dtype=torch.long, device=torch_device)
-            X_tgt0 = torch.tensor(X_tgt0, dtype=torch.float, device=torch_device)
-            X_tgt1 = torch.tensor(X_tgt1, dtype=torch.float, device=torch_device)
+    def f_train(X_src, y_src, X_tgt0, X_tgt1):
+        X_src = torch.tensor(X_src, dtype=torch.float, device=torch_device)
+        y_src = torch.tensor(y_src, dtype=torch.long, device=torch_device)
+        X_tgt0 = torch.tensor(X_tgt0, dtype=torch.float, device=torch_device)
+        X_tgt1 = torch.tensor(X_tgt1, dtype=torch.float, device=torch_device)
 
-            n_samples = X_src0.size()[0]
-            n_total = n_samples + X_tgt0.size()[0]
+        student_optimizer.zero_grad()
+        student_net.train()
+        teacher_net.train()
 
-            student_optimizer.zero_grad()
-            student_net.train()
-            teacher_net.train()
+        src_logits_out = student_net(X_src)
+        student_tgt_logits_out = student_net(X_tgt0)
+        student_tgt_prob_out = F.softmax(student_tgt_logits_out, dim=1)
+        teacher_tgt_logits_out = teacher_net(X_tgt1)
+        teacher_tgt_prob_out = F.softmax(teacher_tgt_logits_out, dim=1)
 
-            # Concatenate source and target mini-batches
-            X0 = torch.cat([X_src0, X_tgt0], 0)
-            X1 = torch.cat([X_src1, X_tgt1], 0)
+        # Supervised classification loss
+        clf_loss = classification_criterion(src_logits_out, y_src)
 
-            student_logits_out = student_net(X0)
-            student_prob_out = F.softmax(student_logits_out, dim=1)
+        unsup_loss, conf_mask_count, unsup_mask_count = compute_aug_loss(student_tgt_prob_out, teacher_tgt_prob_out)
 
-            src_logits_out = student_logits_out[:n_samples]
-            src_prob_out = student_prob_out[:n_samples]
+        loss_expr = clf_loss + unsup_loss * unsup_weight
 
-            teacher_logits_out = teacher_net(X1)
-            teacher_prob_out = F.softmax(teacher_logits_out, dim=1)
+        loss_expr.backward()
+        student_optimizer.step()
+        teacher_optimizer.step()
 
-            # Supervised classification loss
-            if double_softmax:
-                clf_loss = classification_criterion(src_prob_out, y_src)
-            else:
-                clf_loss = classification_criterion(src_logits_out, y_src)
+        n_samples = X_src.size()[0]
 
-            unsup_loss, conf_mask_count, unsup_mask_count = compute_aug_loss(student_prob_out, teacher_prob_out)
-
-            loss_expr = clf_loss + unsup_loss * unsup_weight
-
-            loss_expr.backward()
-            student_optimizer.step()
-            teacher_optimizer.step()
-
-            outputs = [float(clf_loss) * n_samples, float(unsup_loss) * n_total]
-            if not use_rampup:
-                mask_count = float(conf_mask_count) * 0.5
-                unsup_count = float(unsup_mask_count) * 0.5
-
-                outputs.append(mask_count)
-                outputs.append(unsup_count)
-            return tuple(outputs)
-    else:
-        def f_train(X_src, y_src, X_tgt0, X_tgt1):
-            X_src = torch.tensor(X_src, dtype=torch.float, device=torch_device)
-            y_src = torch.tensor(y_src, dtype=torch.long, device=torch_device)
-            X_tgt0 = torch.tensor(X_tgt0, dtype=torch.float, device=torch_device)
-            X_tgt1 = torch.tensor(X_tgt1, dtype=torch.float, device=torch_device)
-
-            student_optimizer.zero_grad()
-            student_net.train()
-            teacher_net.train()
-
-            src_logits_out = student_net(X_src)
-            student_tgt_logits_out = student_net(X_tgt0)
-            student_tgt_prob_out = F.softmax(student_tgt_logits_out, dim=1)
-            teacher_tgt_logits_out = teacher_net(X_tgt1)
-            teacher_tgt_prob_out = F.softmax(teacher_tgt_logits_out, dim=1)
-
-            # Supervised classification loss
-            if double_softmax:
-                clf_loss = classification_criterion(F.softmax(src_logits_out, dim=1), y_src)
-            else:
-                clf_loss = classification_criterion(src_logits_out, y_src)
-
-            unsup_loss, conf_mask_count, unsup_mask_count = compute_aug_loss(student_tgt_prob_out, teacher_tgt_prob_out)
-
-            loss_expr = clf_loss + unsup_loss * unsup_weight
-
-            loss_expr.backward()
-            student_optimizer.step()
-            teacher_optimizer.step()
-
-            n_samples = X_src.size()[0]
-
-            outputs = [float(clf_loss) * n_samples, float(unsup_loss) * n_samples]
-            if not use_rampup:
-                mask_count = float(conf_mask_count)
-                unsup_count = float(unsup_mask_count)
-
-                outputs.append(mask_count)
-                outputs.append(unsup_count)
-            return tuple(outputs)
-
+        outputs = [float(clf_loss) * n_samples, float(unsup_loss) * n_samples]
+        return tuple(outputs)
 
     print('Compiled training function')
 
-    def f_pred_src(X_sup):
+    def f_pred(X_sup):
         X_var = torch.tensor(X_sup, dtype=torch.float, device=torch_device)
         student_net.eval()
         teacher_net.eval()
         return (F.softmax(student_net(X_var), dim=1).detach().cpu().numpy(),
                 F.softmax(teacher_net(X_var), dim=1).detach().cpu().numpy())
 
-    def f_pred_tgt(X_sup):
-        X_var = torch.tensor(X_sup, dtype=torch.float, device=torch_device)
-        student_net.eval()
-        teacher_net.eval()
-        return (F.softmax(student_net(X_var), dim=1).detach().cpu().numpy(),
-                F.softmax(teacher_net(X_var), dim=1).detach().cpu().numpy())
-
-    def f_eval_src(X_sup, y_sup):
-        y_pred_prob_stu, y_pred_prob_tea = f_pred_src(X_sup)
+    def f_eval(X_sup, y_sup):
+        y_pred_prob_stu, y_pred_prob_tea = f_pred(X_sup)
         y_pred_stu = np.argmax(y_pred_prob_stu, axis=1)
         y_pred_tea = np.argmax(y_pred_prob_tea, axis=1)
         return (float((y_pred_stu != y_sup).sum()), float((y_pred_tea != y_sup).sum()))
 
-    def f_eval_tgt(X_sup, y_sup):
-        y_pred_prob_stu, y_pred_prob_tea = f_pred_tgt(X_sup)
+    def f_pred_for_metrics(X_sup, y_sup):
+        y_pred_prob_stu, y_pred_prob_tea = f_pred(X_sup)
         y_pred_stu = np.argmax(y_pred_prob_stu, axis=1)
         y_pred_tea = np.argmax(y_pred_prob_tea, axis=1)
-        return (float((y_pred_stu != y_sup).sum()), float((y_pred_tea != y_sup).sum()))
+        return (y_pred_stu, y_pred_tea, y_pred_prob_stu, y_pred_prob_tea)
 
     print('Compiled evaluation function')
 
-
-    # Setup output
-    def log(text):
-        print(text)
-        if log_file is not None:
-            with open(log_file, 'a') as f:
-                f.write(text + '\n')
-                f.flush()
-                f.close()
     cmdline_helpers.ensure_containing_dir_exists(log_file)
 
     # Report setttings
-    log('Settings: {}'.format(', '.join(['{}={}'.format(key, settings[key]) for key in sorted(list(settings.keys()))])))
-
-    # Report dataset size
-    log('Dataset:')
-    log('SOURCE Train: X.shape={}, y.shape={}'.format(d_source.train_X.shape, d_source.train_y.shape))
-    log('SOURCE Test: X.shape={}, y.shape={}'.format(d_source.test_X.shape, d_source.test_y.shape))
-    log('TARGET Train: X.shape={}'.format(d_target.train_X.shape))
-    log('TARGET Test: X.shape={}, y.shape={}'.format(d_target.test_X.shape, d_target.test_y.shape))
+    log(f'confidence_thresh={confidence_thresh}, teacher_alpha={teacher_alpha},\
+     unsup_weight={unsup_weight}, cls_balance={cls_balance}, learning_rate={learning_rate}, num_epochs={num_epochs}'
+        f'test_model={test_model}')
 
     print('Training...')
-    sup_ds = data_source.ArrayDataSource([d_source.train_X, d_source.train_y], repeats=-1)
-    tgt_train_ds = data_source.ArrayDataSource([d_target.train_X], repeats=-1)
+    sup_ds = data_source.ArrayDataSource([source_train_x_inner, source_train_y_inner], repeats=-1)
+    tgt_train_ds = data_source.ArrayDataSource([target_train_x_inner], repeats=-1)
     train_ds = data_source.CompositeDataSource([sup_ds, tgt_train_ds]).map(augment)
     train_ds = pool.parallel_data_source(train_ds)
     if epoch_size == 'large':
-        n_samples = max(d_source.train_X.shape[0], d_target.train_X.shape[0])
+        n_samples = max(source_train_x_inner.shape[0], target_train_x_inner.shape[0])
     elif epoch_size == 'small':
-        n_samples = min(d_source.train_X.shape[0], d_target.train_X.shape[0])
+        n_samples = min(source_train_x_inner.shape[0], target_train_x_inner.shape[0])
     elif epoch_size == 'target':
-        n_samples = d_target.train_X.shape[0]
+        n_samples = target_train_x_inner.shape[0]
     n_train_batches = n_samples // batch_size
 
-    source_test_ds = data_source.ArrayDataSource([d_source.test_X, d_source.test_y])
-    target_test_ds = data_source.ArrayDataSource([d_target.test_X, d_target.test_y])
+    source_test_ds = data_source.ArrayDataSource([source_validation_x, source_validation_y])
+    target_test_ds = data_source.ArrayDataSource([target_validation_x, target_validation_y])
 
     if seed != 0:
         shuffle_rng = np.random.RandomState(seed)
@@ -475,64 +308,274 @@ def experiment(exp, arch, loss, double_softmax, confidence_thresh, rampup, teach
 
     best_conf_mask_rate = 0.0
     best_src_test_err = 1.0
+    best_target_tea_err = 1.0
+    best_epoch = 0
+    count_no_improve = 0
+    count_no_improve_flag = False
+    t_training_1 = time.time()
     for epoch in range(num_epochs):
         t1 = time.time()
-
-
-        if use_rampup:
-            if epoch < rampup:
-                p = max(0.0, float(epoch)) / float(rampup)
-                p = 1.0 - p
-                rampup_value = math.exp(-p * p * 5.0)
-            else:
-                rampup_value = 1.0
-
-            rampup_weight_in_list[0] = rampup_value
-
         train_res = data_source.batch_map_mean(f_train, train_batch_iter, n_batches=n_train_batches)
-
         train_clf_loss = train_res[0]
-        if combine_batches:
-            unsup_loss_string = 'unsup (both) loss={:.6f}'.format(train_res[1])
+        unsup_loss_string = 'unsup (tgt) loss={:.6f}'.format(train_res[1])
+
+        src_test_err_stu, src_test_err_tea = source_test_ds.batch_map_mean(f_eval, batch_size=batch_size * 2)
+        tgt_test_err_stu, tgt_test_err_tea = target_test_ds.batch_map_mean(f_eval, batch_size=batch_size * 2)
+
+        conf_mask_rate = train_res[-2]
+        unsup_mask_rate = train_res[-1]
+        if conf_mask_rate > best_conf_mask_rate:
+            best_conf_mask_rate = conf_mask_rate
+            improve = '*** '
+            best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
+            best_target_tea_err = tgt_test_err_tea
+            best_epoch = epoch
+            if count_no_improve_flag:
+                count_no_improve_flag = False
+                count_no_improve = 0
         else:
-            unsup_loss_string = 'unsup (tgt) loss={:.6f}'.format(train_res[1])
-
-        src_test_err_stu, src_test_err_tea = source_test_ds.batch_map_mean(f_eval_src, batch_size=batch_size * 2)
-        tgt_test_err_stu, tgt_test_err_tea = target_test_ds.batch_map_mean(f_eval_tgt, batch_size=batch_size * 2)
-
-
-        if use_rampup:
-            unsup_loss_string = '{}, rampup={:.3%}'.format(unsup_loss_string, rampup_value)
-            if src_test_err_stu < best_src_test_err:
-                best_src_test_err = src_test_err_stu
-                best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
-                improve = '*** '
-            else:
-                improve = ''
-        else:
-            conf_mask_rate = train_res[-2]
-            unsup_mask_rate = train_res[-1]
-            if conf_mask_rate > best_conf_mask_rate:
-                best_conf_mask_rate = conf_mask_rate
-                improve = '*** '
-                best_teacher_model_state = {k: v.cpu().numpy() for k, v in teacher_net.state_dict().items()}
-            else:
-                improve = ''
-            unsup_loss_string = '{}, conf mask={:.3%}, unsup mask={:.3%}'.format(
-                unsup_loss_string, conf_mask_rate, unsup_mask_rate)
-
+            improve = ''
+            count_no_improve_flag = True
+            count_no_improve += 1
+        unsup_loss_string = '{}, conf mask={:.3%}, unsup mask={:.3%}'.format(
+            unsup_loss_string, conf_mask_rate, unsup_mask_rate)
         t2 = time.time()
-
 
         log('{}Epoch {} took {:.2f}s: TRAIN clf loss={:.6f}, {}; '
             'SRC TEST ERR={:.3%}, TGT TEST student err={:.3%}, TGT TEST teacher err={:.3%}'.format(
-            improve, epoch, t2 - t1, train_clf_loss, unsup_loss_string, src_test_err_stu, tgt_test_err_stu, tgt_test_err_tea))
+            improve, epoch, t2 - t1, train_clf_loss, unsup_loss_string, src_test_err_stu, tgt_test_err_stu,
+            tgt_test_err_tea))
+        if count_no_improve >= PATIENCE:
+            break
+    t_training_2 = time.time()
+    if test_model:
+        t_inference_1 = time.time()
+        src_pred_stu, src_pred_tea, src_prob_stu, src_prob_tea = source_test_ds.batch_map_concat(f_pred_for_metrics, batch_size=batch_size * 2)
+        t_inference_2 = time.time()
+        tgt_pred_stu, tgt_pred_tea, tgt_prob_stu, tgt_prob_tea = target_test_ds.batch_map_concat(f_pred_for_metrics, batch_size=batch_size * 2)
+        src_stu_scores_dict, src_tea_scores_dict = create_metrics_results(source_validation_y, src_pred_stu, src_pred_tea, src_prob_stu, src_prob_tea)
+        tgt_stu_scores_dict, tgt_tea_scores_dict = create_metrics_results(target_validation_y, tgt_pred_stu, tgt_pred_tea, tgt_prob_stu, tgt_prob_tea)
+        inference_time_for_1000 = (t_inference_2-t_inference_1)/len(src_pred_stu)*2  ## each test batch contains 500 samples
+        return src_stu_scores_dict, src_tea_scores_dict, tgt_stu_scores_dict, tgt_tea_scores_dict, round(t_training_2-t_training_1, 3), round(inference_time_for_1000, 4)
+    return best_target_tea_err, best_teacher_model_state, best_epoch
 
-    # Save network
-    if model_file != '':
-        cmdline_helpers.ensure_containing_dir_exists(model_file)
-        with open(model_file, 'wb') as f:
-            pickle.dump(best_teacher_model_state, f)
+
+def calc_metrics(sup_y, sup_y_one_hot, pred_y, prob, class_labels):
+    scores_dict = {}
+    conf = confusion_matrix(sup_y, pred_y)
+    tpr_list = []
+    fpr_list = []
+    for label in range(conf.shape[0]):
+        tpr = conf[label][label] / sum(conf[label])
+        tpr_list.append(tpr)
+        fpr_numerator = sum([pred_row[label] for pred_row in conf]) - conf[label][label]
+        fpr_denominator = sum(sum(conf)) - sum(conf[label])
+        fpr_list.append(fpr_numerator / fpr_denominator)
+    scores_dict['tpr'] = np.round(np.mean(tpr_list), 4)
+    scores_dict['fpr'] = np.round(np.mean(fpr_list), 4)
+
+    scores_dict['acc'] = np.round(metrics.accuracy_score(sup_y, pred_y), 2)
+    scores_dict['roc_auc'] = np.round(metrics.roc_auc_score(sup_y, prob, multi_class='ovr'), 4)
+    scores_dict['precision'] = np.round(metrics.precision_score(sup_y, pred_y, average='macro'), 4)
+
+    pred_one_hot = label_binarize(pred_y, classes=class_labels)
+    scores_dict['recall_precision_auc'] = np.round(metrics.average_precision_score(sup_y_one_hot, pred_one_hot, average="macro"), 4)
+    scores_dict['err'] = float((pred_y != sup_y).mean())
+    return scores_dict
+
+
+def create_metrics_results(sup_y, pred_stu, pred_tea, prob_stu, prob_tea):
+    class_labels = list(np.unique(sup_y))
+    sup_y_one_hot = label_binarize(sup_y, classes=class_labels)
+    stu_scores_dict = calc_metrics(sup_y, sup_y_one_hot, pred_stu, prob_stu, class_labels)
+    tea_scores_dict = calc_metrics(sup_y, sup_y_one_hot, pred_tea, prob_tea, class_labels)
+    return stu_scores_dict, tea_scores_dict
+
+
+def get_arch(exp, arch):
+    if arch == '':
+        if exp in {'mnist_usps', 'usps_mnist'}:
+            arch = 'mnist-bn-32-64-256'
+        elif exp in {'svhn_mnist', 'mnist_svhn'}:
+            arch = 'mnist-bn-32-32-64-256'
+        if exp in {'cifar_stl', 'stl_cifar', 'syndigits_svhn', 'svhn_mnist_rgb', 'mnist_svhn_rgb'}:
+            arch = 'mnist-bn-32-32-64-256-rgb'
+        # if exp in {'synsigns_gtsrb'}:
+        #     arch = 'rgb40-96-192-384-gp'
+    return arch
+
+
+def evaluate_exp(confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate, arch=''):
+    arch = get_arch(exp, arch)
+
+    cv_source = StratifiedKFold(n_splits=INNER_K_FOLD, shuffle=True)
+    source_train_validation_list = []
+    for train_idx, validation_idx in cv_source.split(source_train_x, source_train_y):
+        source_dict = {}
+        train_data, validation_data = source_train_x[train_idx], source_train_x[validation_idx]
+        train_target, validation_target = source_train_y[train_idx], source_train_y[validation_idx]
+        source_dict['source_train_x'] = train_data
+        source_dict['source_train_y'] = train_target
+        source_dict['source_validation_x'] = validation_data
+        source_dict['source_validation_y'] = validation_target
+        source_train_validation_list.append(source_dict)
+
+    cv_target = StratifiedKFold(n_splits=INNER_K_FOLD, shuffle=True)
+    target_train_validation_list = []
+    for train_idx, validation_idx in cv_target.split(target_train_x, target_train_y):
+        target_dict = {}
+        train_data, validation_data = target_train_x[train_idx], target_train_x[validation_idx]
+        validation_target = target_train_y[validation_idx]
+        target_dict['target_train_x'] = train_data
+        target_dict['target_validation_x'] = validation_data
+        target_dict['target_validation_y'] = validation_target
+        target_train_validation_list.append(target_dict)
+
+    target_test_err_list = []
+    best_epoch_list = []
+    for cv_idx in range(INNER_K_FOLD):
+        print(f'start inner cv {cv_idx}')
+        log(f'start inner cv {cv_idx}')
+        source_train_x_inner = source_train_validation_list[cv_idx]['source_train_x']
+        source_train_y_inner = source_train_validation_list[cv_idx]['source_train_y']
+        source_validation_x = source_train_validation_list[cv_idx]['source_validation_x']
+        source_validation_y = source_train_validation_list[cv_idx]['source_validation_y']
+        target_train_x_inner = target_train_validation_list[cv_idx]['target_train_x']
+        target_validation_x = target_train_validation_list[cv_idx]['target_validation_x']
+        target_validation_y = target_train_validation_list[cv_idx]['target_validation_y']
+
+        if cv_idx == 0:
+            # Report dataset size
+            log('Dataset:')
+            log('SOURCE Train: X.shape={}, y.shape={}'.format(source_train_x_inner.shape, source_train_y_inner.shape))
+            log('SOURCE Val: X.shape={}, y.shape={}'.format(source_validation_x.shape, source_validation_y.shape))
+            log('TARGET Train: X.shape={}'.format(target_train_x_inner.shape))
+            log('TARGET Val: X.shape={}, y.shape={}'.format(target_validation_x.shape, target_validation_y.shape))
+
+        best_target_tea_err, best_teacher_model_state, best_epoch = build_and_train_model(
+            source_train_x_inner, source_train_y_inner, target_train_x_inner,
+            source_validation_x, source_validation_y, target_validation_x, target_validation_y,
+            confidence_thresh, teacher_alpha, unsup_weight, cls_balance, learning_rate,
+            arch)
+        target_test_err_list.append(best_target_tea_err)
+        best_epoch_list.append(best_epoch)
+
+        # Save network
+        if model_file != '':
+            cmdline_helpers.ensure_containing_dir_exists(model_file)
+            with open(model_file, 'wb') as f:
+                pickle.dump(best_teacher_model_state, f)
+
+    BEST_EPOCHS_LIST.append(int(np.mean(best_epoch_list)))
+    return -np.mean(target_test_err_list)
+
+
+def rebuild_and_test_model(params, source_train_x, source_train_y, target_train_x, source_test_x,
+                           source_test_y, target_test_x, target_test_y, arch=''):
+    log(f"Start rebuild on test set")
+    arch = get_arch(exp, arch)
+    best_epoch = np.max(BEST_EPOCHS_LIST)
+    log(f'best_epoch: {best_epoch}')
+    results = build_and_train_model(
+        source_train_x, source_train_y, target_train_x, source_test_x, source_test_y, target_test_x, target_test_y,
+        arch=arch, test_model=True, num_epochs=best_epoch, **params)
+    src_stu_scores_dict = results[0]
+    src_tea_scores_dict = results[1]
+    tgt_stu_scores_dict = results[2]
+    tgt_tea_scores_dict = results[3]
+    training_time = results[4]
+    inference_time = results[5]
+    log(f'src_stu_scores_dict: {src_stu_scores_dict}')
+    log(f'src_tea_scores_dict: {src_tea_scores_dict}')
+    log(f'tgt_stu_scores_dict: {tgt_stu_scores_dict}')
+    log(f'tgt_tea_scores_dict: {tgt_tea_scores_dict}')
+    log(f'training_time: {training_time}')
+    log(f'inference_time for 1000 instences: {inference_time}')
+    tgt_tea_scores_dict.update({'training_time': training_time, 'inference_time': inference_time, 'params': params})
+    tgt_scores = pd.Series(tgt_tea_scores_dict)
+    return tgt_scores
+
 
 if __name__ == '__main__':
-    experiment()
+    # The hyper-parameters that got in the paper
+    # confidence_thresh = 0.96837722, teacher_alpha = 0.99, unsup_weight = 3.0, cls_balance = 0.005, learning_rate = 0.001
+    global source_train_x, source_train_y, target_train_x, target_train_y
+
+    source_x, source_y, target_x, target_y, n_classes = load_data(exp=exp)
+
+    if log_file == '':
+        log_file = 'output_aug_log_{}.txt'.format(exp)
+    elif log_file == 'none':
+        log_file = None
+
+    cv_source = StratifiedKFold(n_splits=OUTER_K_FOLD, shuffle=True)
+    source_train_test_list = []
+    for train_idx, test_idx in cv_source.split(source_x, source_y):
+        source_dict = {}
+        train_data, test_data = source_x[train_idx], source_x[test_idx]
+        train_target, test_target = source_y[train_idx], source_y[test_idx]
+        source_dict['source_train_x'] = train_data[:1000]
+        source_dict['source_train_y'] = train_target[:1000]
+        source_dict['source_test_x'] = test_data[:300]
+        source_dict['source_test_y'] = test_target[:300]
+        source_train_test_list.append(source_dict)
+
+    cv_target = StratifiedKFold(n_splits=OUTER_K_FOLD, shuffle=True)
+    target_train_test_list = []
+    for train_idx, test_idx in cv_target.split(target_x, target_y):
+        target_dict = {}
+        train_data, test_data = target_x[train_idx], target_x[test_idx]
+        train_target, test_target = target_y[train_idx], target_y[test_idx]
+        target_dict['target_train_x'] = train_data[:1000]
+        target_dict['target_train_y'] = train_target[:1000]
+        target_dict['target_test_x'] = test_data[:300]
+        target_dict['target_test_y'] = test_target[:300]
+        target_train_test_list.append(target_dict)
+
+    tgt_scores_list = []
+    try:
+        for cv_idx in range(OUTER_K_FOLD):
+            print(f'start outer cv {cv_idx}')
+            log(f'start outer cv {cv_idx}')
+            source_train_x = source_train_test_list[cv_idx]['source_train_x']
+            source_train_y = source_train_test_list[cv_idx]['source_train_y']
+            source_test_x = source_train_test_list[cv_idx]['source_test_x']
+            source_test_y = source_train_test_list[cv_idx]['source_test_y']
+            target_train_x = target_train_test_list[cv_idx]['target_train_x']
+            target_train_y = target_train_test_list[cv_idx]['target_train_y']
+            target_test_x = target_train_test_list[cv_idx]['target_test_x']
+            target_test_y = target_train_test_list[cv_idx]['target_test_y']
+
+            if cv_idx == 0:
+                # Report dataset size
+                log('Dataset:')
+                log('SOURCE Train: X.shape={}, y.shape={}'.format(source_train_x.shape, source_train_y.shape))
+                log('SOURCE Test: X.shape={}, y.shape={}'.format(source_test_x.shape, source_test_y.shape))
+                log('TARGET Train: X.shape={}'.format(target_train_x.shape))
+                log('TARGET Test: X.shape={}, y.shape={}'.format(target_test_x.shape, target_test_y.shape))
+
+            domain_adapt_BO = BayesianOptimization(evaluate_exp, {'confidence_thresh': (0.5, 1.0),
+                                                                'teacher_alpha': (0.5, 1.0),
+                                                                'unsup_weight': (1.0, 3.0),
+                                                                'cls_balance': (0.005, 0.01),
+                                                                'learning_rate': (0.0001, 0.01)
+                                                                })
+            domain_adapt_BO.maximize(init_points=init_points, n_iter=bo_num_iter)
+            params_domain_adapt = domain_adapt_BO.max['params']
+            if 'rampup' in params_domain_adapt:
+                params_domain_adapt['rampup'] = round(params_domain_adapt['rampup'])
+
+            log(f'outer CV {cv_idx} - Opt hyper params: {params_domain_adapt} \n with target of: {domain_adapt_BO.max["target"]}')
+
+            tgt_scores = rebuild_and_test_model(params_domain_adapt, source_train_x, source_train_y, target_train_x, source_test_x,
+                               source_test_y, target_test_x, target_test_y)
+            tgt_scores_list.append(tgt_scores)
+            log('*********************************************************************** \n')
+    except Exception:
+        log(f"stopped at cv: {cv_idx}")
+        raise
+    finally:
+        if len(tgt_scores_list) > 0:
+            tgt_scores_df = pd.DataFrame(tgt_scores_list)
+            date = datetime.datetime.now().strftime('%d-%m_%H-%M')
+            tgt_scores_df.to_csv(f"./mean_teacher/tgt_scores_df_{exp}_until_cv_{cv_idx}_{date}.csv")
